@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#1565C0</color>
+    <color name="primary_dark">#0D47A1</color>
+    <color name="accent">#FF8F00</color>
+    <color name="bg">#F5F6F8</color>
+    <color name="card">#FFFFFF</color>
+    <color name="text_main">#1B1B1F</color>
+    <color name="text_sub">#5C5F66</color>
+    <color name="warn">#C62828</color>
+    <color name="ok">#2E7D32</color>
+    <color name="scrim">#E0101420</color>
+    <color name="panel_bg">#FFFFFF</color>
+    <color name="ic_launcher_background">#1565C0</color>
+</resources>

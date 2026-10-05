@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">解锁限时</string>
+
+    <!-- 状态 -->
+    <string name="state_no_session">已锁屏／无会话</string>
+    <string name="state_pending">待选择</string>
+    <string name="state_timing">正在计时</string>
+    <string name="state_unlimited">本次不限</string>
+    <string name="state_lock_requested">已发出锁屏请求</string>
+    <string name="state_lock_failed">锁屏失败</string>
+
+    <string name="monitor_waiting">监控运行中 · 等待解锁</string>
+    <string name="monitor_pending">等待选择本次时长</string>
+    <string name="monitor_timing">剩余 %1$s</string>
+    <string name="monitor_unlimited">本次不限时</string>
+    <string name="monitor_lock_requested">正在锁屏…</string>
+    <string name="monitor_lock_failed">锁屏失败：%1$s</string>
+    <string name="monitor_disabled">监控已关闭</string>
+
+    <!-- 主界面 -->
+    <string name="status_title">当前状态</string>
+    <string name="status_none">当前状态：--</string>
+    <string name="perm_title">系统授权</string>
+    <string name="perm_admin_ok">设备管理员：已启用（可锁屏）</string>
+    <string name="perm_admin_missing">设备管理员：未启用（到期无法锁屏）</string>
+    <string name="perm_admin_btn">启用设备管理员</string>
+    <string name="perm_overlay_ok">悬浮窗权限：已授予</string>
+    <string name="perm_overlay_missing">悬浮窗权限：未授予（无法强制选择）</string>
+    <string name="perm_overlay_btn">授权悬浮窗</string>
+    <string name="perm_battery_ok">电池优化：已忽略</string>
+    <string name="perm_battery_missing">电池优化：未忽略（后台可能被清理）</string>
+    <string name="perm_battery_btn">申请忽略电池优化</string>
+    <string name="perm_autostart_btn">打开 OPPO 自启动设置</string>
+    <string name="keyguard_hint">提示：当前系统未设置锁屏密码。到期锁屏可用，但他人可直接滑动解锁；正式使用请先设置锁屏密码。</string>
+    <string name="monitor_switch">解锁监控</string>
+    <string name="monitor_switch_locked_hint">正在会话中，监控开关已锁定，防止间接取消计时</string>
+    <string name="quick_title">快捷时长（分钟，仅影响之后的新会话）</string>
+    <string name="quick_save">保存</string>
+    <string name="diag_title">诊断</string>
+    <string name="diag_view">查看日志</string>
+    <string name="diag_export">导出日志</string>
+    <string name="diag_recover">立即自检恢复</string>
+    <string name="debug_title">调试工具（仅 debug 构建）</string>
+    <string name="debug_replay_alarm">重放当前会话到期事件</string>
+    <string name="debug_force_lock">立即请求锁屏（测试）</string>
+    <string name="version_fmt">版本 %1$s（vc%2$d）· 目标设备 OPPO R15x / Android 10</string>
+
+    <!-- 选择面板 -->
+    <string name="sel_title">请选择本次使用时长</string>
+    <string name="sel_subtitle">选择完成后开始计时；锁屏后本次结束</string>
+    <string name="sel_unlimited">不限</string>
+    <string name="sel_custom">自定义…</string>
+    <string name="sel_custom_hint">输入分钟数（1–2880）</string>
+    <string name="sel_custom_debug_hint">输入数值（勾选“秒”时为秒数，1–7200）</string>
+    <string name="sel_custom_ok">确定</string>
+    <string name="sel_custom_back">返回</string>
+    <string name="sel_custom_invalid">请输入 1–2880 之间的整数分钟</string>
+    <string name="sel_custom_invalid_seconds">请输入 1–7200 之间的整数秒</string>
+    <string name="minutes_fmt">%1$d 分钟</string>
+
+    <!-- 日志 -->
+    <string name="log_title">诊断日志</string>
+    <string name="log_export_subject">解锁限时诊断日志</string>
+
+    <!-- 通知 -->
+    <string name="notif_channel_name">会话状态</string>
+    <string name="notif_channel_desc">解锁限时监控与剩余时间</string>
+
+    <!-- ColorOS 指引 -->
+    <string name="coloros_guide_title">OPPO 后台设置指引</string>
+    <string name="coloros_guide_text">为保证锁屏准时，请在本机完成：\n1. 设置 → 电池 → 应用耗电管理 → 本应用 → 允许后台运行；\n2. 最近任务里下拉本应用卡片 → 锁定；\n3. 设置 → 电池 → 智能省电 / 应用速冻，将本应用排除；\n具体菜单名称随 ColorOS 版本略有差异，以真机为准。</string>
+</resources>

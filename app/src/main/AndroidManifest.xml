@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 前台服务：解锁监控与计时 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 开机后恢复监控与状态核对 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 待选择界面使用 TYPE_APPLICATION_OVERLAY 悬浮层 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 引导用户加入电池优化白名单（ColorOS 后台保活） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.UnlockSession">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 悬浮窗权限缺失时的兜底选择页（从通知进入），选择要求仍然生效 -->
+        <activity
+            android:name=".ui.SelectionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@style/Theme.UnlockSession.Translucent" />
+
+        <activity
+            android:name=".ui.LogActivity"
+            android:exported="false"
+            android:label="@string/log_title" />
+
+        <!-- 解锁监控前台服务：动态注册 SCREEN_ON/OFF、USER_PRESENT，
+             串行驱动 SessionController 状态机 -->
+        <service
+            android:name=".service.UnlockMonitorService"
+            android:exported="false" />
+
+        <!-- 到期精确闹钟 -->
+        <receiver
+            android:name=".service.SessionAlarmReceiver"
+            android:exported="false" />
+
+        <!-- 最小设备管理员：仅 force-lock，用于 DevicePolicyManager.lockNow() -->
+        <receiver
+            android:name=".service.AdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/admin_policies" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 开机 / 应用更新后恢复监控 -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 诊断日志导出 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>
