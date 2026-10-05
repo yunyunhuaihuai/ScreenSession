@@ -17,6 +17,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         diagnostics = Diagnostics.get(this)
+        diagnostics.attachContext(this)
         val repo = SessionRepository(this)
         val env = AndroidEnv(this, repo, diagnostics)
         val controller = SessionController(repo, diagnostics, env)

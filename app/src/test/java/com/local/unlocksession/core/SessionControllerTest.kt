@@ -312,7 +312,7 @@ class SessionControllerTest {
         env.advance(30_000)
         c.handleReminderAsync(c.snapshot.sessionId, 30_000L) {}
         assertEquals(listOf(60_000L, 30_000L), env.remindersShown)
-        assertTrue(diag.has("RMD", "提前提醒已投递 threshold=60000"))
+        assertTrue(diag.has("RMD", "threshold=60000"))
     }
 
     @Test
@@ -730,5 +730,67 @@ class SessionControllerTest {
         val c = SessionController(store, RecordingDiag(), env, directExecutor)
         c.handleAlarmAsync(1L) { finished++ }
         assertEquals(1, finished)
+    }
+    // ------------------------------------------------------------------
+    // R0 补充：解锁一致性心跳（宽限期放行无广播场景）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `心跳发现宽限期放行后无会话则补待选择`() {
+        val (c, env, diag) = newController()
+        // 亮屏但 keyguard 锁定：SCREEN_ON 不建会话，但启动心跳
+        env.kgLocked = true
+        env.devLocked = true
+        c.signalScreenOn()
+        assertEquals(SessionState.NO_SESSION, c.snapshot.state)
+        // 宽限期内上滑放行：无任何广播，keyguard 直接消失
+        env.kgLocked = false
+        env.devLocked = false
+        env.advance(2_000)
+        assertEquals(SessionState.PENDING_SELECTION, c.snapshot.state)
+        assertTrue(diag.has("HB", "补上待选择"))
+        // 建会话后心跳不再运行
+        val sessionId = c.snapshot.sessionId
+        c.select(sessionId, false, 60_000L)
+        env.advance(6_000)
+        assertEquals(SessionState.TIMING, c.snapshot.state)
+    }
+
+    @Test
+    fun `心跳在keyguard始终锁定时空转不建会话`() {
+        val (c, env, _) = newController()
+        env.kgLocked = true
+        env.devLocked = true
+        c.signalScreenOn()
+        env.advance(10_000)
+        assertEquals(SessionState.NO_SESSION, c.snapshot.state)
+        assertTrue(env.overlaysShown.isEmpty())
+    }
+
+    @Test
+    fun `tick兜底在提醒闹钟迟到时准时投递`() {
+        val (c, env, diag) = newController()
+        // 模拟 ColorOS 推迟提醒闹钟：会话 120s，60s 提醒闹钟被推迟（不触发），
+        // tick 每秒运行应在 trigger 后 1 秒内兜底投递
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 120_000L)
+        env.advance(60_500) // tick 链逐秒推进，60s 时点已过 0.5s
+        assertEquals("闹钟未触发时 tick 必须兜底", listOf(60_000L), env.remindersShown)
+        // 之后真实闹钟迟到到达：已消费 → 不重复
+        c.handleReminderAsync(c.snapshot.sessionId, 60_000L) {}
+        assertEquals(1, env.remindersShown.size)
+        assertFalse(diag.has("RMD", "跳过不补发 threshold=60000"))
+    }
+
+    @Test
+    fun `tick兜底不影响到期判定且投递后闹钟路径被抑制`() {
+        val (c, env, _) = newController()
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 90_000L)
+        env.advance(89_800) // 90s 会话：60s 时点（30s 处）与 30s 时点（60s 处）均由 tick 兜底投递
+        assertEquals(listOf(60_000L, 30_000L), env.remindersShown)
+        env.advance(500) // 到期：tick 触发锁屏
+        assertEquals(SessionState.LOCK_REQUESTED, c.snapshot.state)
+        assertEquals(1, env.lockCalls.size)
     }
 }

@@ -50,6 +50,7 @@ class SessionController internal constructor(
 
     private var started = false
     private var lockRetries = 0
+    private var lastTickTrace = 0L
 
     /** R0：keyguard 过渡期复核的代次，熄屏/新广播即作废旧复核 */
     private var recheckGeneration = 0L
@@ -103,6 +104,9 @@ class SessionController internal constructor(
         )
         if (gateIfNeeded(ev)) return@submit
         process(ev)
+        // 亮屏期间启动一致性心跳：宽限期内无凭据放行不产生任何广播（实测 ColorOS 上滑
+        // 放行连 USER_PRESENT 都不发），必须靠心跳发现"已解锁却无会话"的不一致状态
+        if (env.isInteractive()) startUnlockHeartbeat()
     }
 
     fun signalScreenOff() = submit {
@@ -110,6 +114,7 @@ class SessionController internal constructor(
         // 真实锁屏周期开始：作废一切进行中的 keyguard 复核
         recheckGeneration++
         env.cancelDelayed(KEY_KG_RECHECK)
+        env.cancelDelayed(KEY_HEARTBEAT)
         val ev = SessionEvent.ScreenOff(
             keyguardLocked = keyguardLockedFact(),
             isDeviceLocked = env.isDeviceLocked(),
@@ -479,6 +484,35 @@ class SessionController internal constructor(
     private fun keyguardLockedFact(): Boolean = env.isKeyguardLocked() || env.isDeviceLocked()
 
     // ------------------------------------------------------------------
+    // R0 补充：解锁一致性心跳
+    // ------------------------------------------------------------------
+
+    /**
+     * 亮屏期间每 2 秒核对"可交互 + keyguard 未锁 + 无会话"。
+     * 仅在亮屏时运行、熄屏即停、发现不一致（补出待选择）即停；
+     * 不写磁盘、不持有唤醒锁，不替代 USER_PRESENT 主路径，
+     * 专堵"宽限期无凭据放行"等不产生任何广播的解锁路径。
+     */
+    private fun startUnlockHeartbeat() {
+        env.postDelayed(KEY_HEARTBEAT, HEARTBEAT_MS) { submit { heartbeatOnce() } }
+    }
+
+    private fun heartbeatOnce() {
+        if (!env.isInteractive()) {
+            diag.log("HB", "心跳停止：已熄屏")
+            return
+        }
+        if (snapshot.state != SessionState.NO_SESSION) return // 会话存在：无需再查
+        if (!repo.isMonitoringEnabled() || !env.isAdminActive() || !env.canDrawOverlays()) return
+        if (!env.isKeyguardLocked() && !env.isDeviceLocked()) {
+            diag.log("HB", "心跳发现已解锁且无会话：补上待选择（宽限期放行或广播丢失）")
+            process(SessionEvent.ScreenOn(interactive = true, keyguardLocked = false, nextSessionId = repo.peekNextSessionId()))
+            return
+        }
+        env.postDelayed(KEY_HEARTBEAT, HEARTBEAT_MS) { submit { heartbeatOnce() } }
+    }
+
+    // ------------------------------------------------------------------
     // 内部：串行处理
     // ------------------------------------------------------------------
 
@@ -695,14 +729,45 @@ class SessionController internal constructor(
         val cur = snapshot
         if (!cur.isTiming) return
         val now = env.nowElapsed()
+        // 低频轨迹：验证 tick 链连续性（每 10s 一行，不做每秒刷屏）
+        if (now - lastTickTrace >= 10_000L) {
+            lastTickTrace = now
+            diag.log("TICK-TRACE", "tick 运行中 now=$now deadline=${cur.deadlineElapsed}")
+        }
         if (now >= cur.deadlineElapsed) {
             // 兜底到期：与系统闹钟走同一状态机路径，幂等
             diag.log("TICK", "进程内兜底检查触发到期（now=$now ≥ deadline=${cur.deadlineElapsed}）")
             process(SessionEvent.AlarmFired(cur.sessionId, now))
             return
         }
+        deliverDueRemindersViaTick(cur, now)
         if (repo.isShowCountdown()) env.notifySession(cur, true)
         env.postDelayed(KEY_TICK, TICK_MS) { submit { tickOnce() } }
+    }
+
+    /**
+     * 提醒兜底：真机（ColorOS）实测会把同应用的多个精确闹钟合并推迟（60s 提醒被推到
+     * 30s 时刻才触发，超窗被正确跳过）。tick 每秒运行，发现"已到点且未消费"的提醒
+     * 立即投递（消费标记先行），把提醒准时性从闹钟路径的 ±OEM 推迟补到 ±1s。
+     * 到期锁屏不依赖本兜底（主路径仍是到期闹钟）。
+     */
+    private fun deliverDueRemindersViaTick(snap: SessionSnapshot, now: Long) {
+        if (snap.sessionReminderThresholds.isEmpty()) return
+        val duration = snap.deadlineElapsed - snap.startedElapsed
+        for (t in snap.sessionReminderThresholds) {
+            val trigger = snap.deadlineElapsed - t * 1000L
+            if (t * 1000L !in 1 until duration) continue
+            if (now < trigger) continue
+            val key = "${snap.sessionId}:${t * 1000L}"
+            if (key in repo.consumedReminders()) continue
+            if (!repo.markReminderConsumed(key)) continue
+            if (env.notificationsEnabled()) {
+                env.notifyReminder(snap.sessionId, t * 1000L)
+                diag.log("RMD", "tick 兜底投递提醒 threshold=${t * 1000L}ms（闹钟迟到补偿）now=$now trigger=$trigger")
+            } else {
+                diag.log("RMD", "tick 兜底发现到点提醒但通知被禁用，无法呈现 threshold=${t * 1000L}ms")
+            }
+        }
     }
 
     /** 冷启动核对：开机归属 + 真实锁屏状态（R2）。返回 false 表示事件应丢弃 */
@@ -798,12 +863,14 @@ class SessionController internal constructor(
         private const val KEY_WATCHDOG = "watchdog"
         private const val KEY_LOCK_RETRY = "lock-retry"
         private const val KEY_KG_RECHECK = "kg-recheck"
+        private const val KEY_HEARTBEAT = "unlock-heartbeat"
         private const val KEY_TEST_REMINDER_CLEAR = "test-reminder-clear"
 
         private const val TICK_MS = 1000L
         private const val LOCK_RETRY_MS = 3000L
         private const val KG_RECHECK_INTERVAL_MS = 300L
         private const val KG_RECHECK_MAX_TRIES = 6
+        private const val HEARTBEAT_MS = 2000L
         private const val TEST_REMINDER_THROTTLE_MS = 2000L
         private const val TEST_REMINDER_AUTO_CLEAR_MS = 10_000L
 

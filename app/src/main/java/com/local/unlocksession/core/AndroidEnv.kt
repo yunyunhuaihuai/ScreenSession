@@ -77,14 +77,14 @@ class AndroidEnv(
     override fun scheduleDeadlineAlarm(sessionId: Long, deadlineElapsed: Long): Boolean {
         val am = appContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         return try {
-            am.setExact(
+            am.setExactAndAllowWhileIdle(
                 AlarmManager.ELAPSED_REALTIME_WAKEUP,
                 deadlineElapsed,
                 alarmPendingIntent(sessionId)
             )
             true
         } catch (e: Exception) {
-            diag.log("ALARM", "setExact 失败: ${e.javaClass.simpleName}: ${e.message}")
+            diag.log("ALARM", "到期闹钟排定失败: ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
@@ -112,7 +112,7 @@ class AndroidEnv(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return try {
-            am.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerElapsed, pi)
+            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerElapsed, pi)
             true
         } catch (e: Exception) {
             diag.log("RMD", "提醒闹钟排定失败 threshold=${thresholdMs}ms: ${e.message}")

@@ -15,8 +15,8 @@ android {
         // targetSdk = 29：与目标设备 Android 10 的实际执行链路一致（前台服务无需类型声明、
         // 精确闹钟无 API 31 限制、通知无运行时权限），单机侧载、不上架
         targetSdk = 29
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
 
     buildTypes {
