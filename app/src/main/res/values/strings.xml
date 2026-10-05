@@ -13,6 +13,7 @@
     <string name="monitor_waiting">监控运行中 · 等待解锁</string>
     <string name="monitor_pending">等待选择本次时长</string>
     <string name="monitor_timing">剩余 %1$s</string>
+    <string name="monitor_timing_hidden">正在计时</string>
     <string name="monitor_unlimited">本次不限时</string>
     <string name="monitor_lock_requested">正在锁屏…</string>
     <string name="monitor_lock_failed">锁屏失败：%1$s</string>
@@ -58,6 +59,22 @@
     <string name="sel_custom_invalid">请输入 1–2880 之间的整数分钟</string>
     <string name="sel_custom_invalid_seconds">请输入 1–7200 之间的整数秒</string>
     <string name="minutes_fmt">%1$d 分钟</string>
+
+    <!-- 通知与提醒 -->
+    <string name="notif_card_title">通知与提醒</string>
+    <string name="show_countdown">在通知栏显示倒计时</string>
+    <string name="show_countdown_hint">关闭后保留监控运行通知；只影响显示，不影响计时与提醒</string>
+    <string name="reminders_switch">锁屏提前提醒</string>
+    <string name="reminders_hint">剩余指定时间时横幅提示并短震动；修改从下次会话生效</string>
+    <string name="reminder_thresholds_label">提醒时点（剩余多少秒，修改从下次会话生效）</string>
+    <string name="reminder_add_hint">秒数，如 60（1 分钟）</string>
+    <string name="reminder_add">添加</string>
+    <string name="reminder_invalid">请输入 1–172800 之间的整数秒，且不能与已有时点重复</string>
+    <string name="reminder_test">测试提醒</string>
+    <string name="reminder_test_sent">已发出测试提醒（10 秒后自动清除）</string>
+    <string name="reminder_test_disabled">通知已被系统关闭，无法呈现提醒</string>
+    <string name="reminder_test_throttled">操作过于频繁，请稍后再试</string>
+    <string name="notif_settings">系统通知设置</string>
 
     <!-- 日志 -->
     <string name="log_title">诊断日志</string>

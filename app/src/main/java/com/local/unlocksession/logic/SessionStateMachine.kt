@@ -5,15 +5,13 @@ package com.local.unlocksession.logic
  *
  * 设计约束（对应交付说明中的会话规则）：
  * - 所有 UI、广播、服务恢复、闹钟事件都走 reduce()，由 SessionController 在单线程上串行调用；
- * - 任何到期/锁屏事件必须核对会话标识，旧会话事件一律忽略；
+ * - 任何到期/锁屏/提醒事件必须核对会话标识，旧会话事件一律忽略；
  * - 截止时间一旦设定不再改变（不接受取消/暂停/延长/缩短/转不限）；
- * - 熄屏即结束会话（通话中接近传感器熄屏除外）；
+ * - 只有 nowElapsed >= deadlineElapsed 才执行到期锁屏：不把任何容差用于提前扣减用户时间（R3）；
+ * - 熄屏即结束会话：通话接近黑屏（keyguard 未接管）保持会话，真实锁屏/到期确认必须生效（R5）；
  * - 输入是纯函数：同样输入得到同样输出，便于单测幂等与恢复。
  */
 object SessionMachine {
-
-    /** 闹钟允许的提前触发容差（毫秒） */
-    const val ALARM_TOLERANCE_MS: Long = 1500L
 
     /** 锁屏看门狗默认延时：lockNow 之后仍未确认熄屏则判失败 */
     const val LOCK_WATCHDOG_MS: Long = 10_000L
@@ -21,11 +19,18 @@ object SessionMachine {
     /** 会话时长上限（毫秒）：48 小时，防溢出与误输入 */
     const val MAX_SESSION_MS: Long = DurationInput.MAX_MINUTES * 60_000L
 
+    /**
+     * 同解锁周期重复事件的容忍窗口：会话开始后短时间内的重复 USER_PRESENT
+     * 视为同一次解锁的迟到/重复广播，不重置会话（R4）。
+     */
+    const val DUPLICATE_UNLOCK_WINDOW_MS: Long = 3000L
+
     fun reduce(cur: SessionSnapshot, ev: SessionEvent): Transition = when (ev) {
         is SessionEvent.ScreenOn -> onScreenOn(cur, ev)
         is SessionEvent.ScreenOff -> onScreenOff(cur, ev)
         is SessionEvent.UserPresent -> onUserPresent(cur, ev)
         is SessionEvent.AlarmFired -> onAlarmFired(cur, ev)
+        is SessionEvent.AlarmScheduleOutcome -> onAlarmScheduleOutcome(cur, ev)
         is SessionEvent.Selected -> onSelected(cur, ev)
         is SessionEvent.LockOutcome -> onLockOutcome(cur, ev)
         is SessionEvent.LockWatchdog -> onLockWatchdog(cur, ev)
@@ -40,7 +45,7 @@ object SessionMachine {
         // 此时普通应用已经可用，必须立即进入待选择，否则会绕过选择要求。
         if (cur.state == SessionState.NO_SESSION && ev.interactive && !ev.keyguardLocked) {
             return Transition(
-                pending(ev.nextSessionId, elapsedZero()),
+                pending(ev.nextSessionId),
                 listOf(
                     SessionAction.Persist,
                     SessionAction.ShowSelectionOverlay,
@@ -49,9 +54,9 @@ object SessionMachine {
                 "screen_on 时已交互未锁屏且无会话：漏事件安全网，进入待选择"
             )
         }
-        // 计时中亮屏但 keyguard 处于锁定：说明期间发生过一次我们漏记的真实锁屏，
+        // 计时/不限中亮屏且 keyguard 处于锁定：说明期间发生过一次我们漏记的真实锁屏，
         // 会话应当已经结束——现在补记结束，等待 USER_PRESENT 开新会话。
-        if (cur.state == SessionState.TIMING && ev.keyguardLocked) {
+        if (cur.isActive && ev.keyguardLocked) {
             return Transition(
                 cleared(),
                 listOf(
@@ -60,19 +65,31 @@ object SessionMachine {
                     SessionAction.Persist,
                     SessionAction.UpdateNotification
                 ),
-                "计时中亮屏且 keyguard 已锁：补记漏掉的熄屏结束"
+                "活动中亮屏且 keyguard 已锁：补记漏掉的熄屏结束"
             )
         }
         return Transition(cur)
     }
 
     // ------------------------------------------------------------------
-    // SCREEN_OFF：熄屏即结束会话（通话中熄屏除外）
+    // SCREEN_OFF：熄屏即结束会话；通话接近黑屏（keyguard 未接管）除外（R5）
     // ------------------------------------------------------------------
     private fun onScreenOff(cur: SessionSnapshot, ev: SessionEvent.ScreenOff): Transition {
-        if (ev.inCall) {
-            // 通话中的接近传感器黑屏不是会话结束信号
-            return Transition(cur, note = "通话中熄屏，忽略（state=${cur.state}）")
+        // 到期锁屏确认优先：LOCK_REQUESTED 的熄屏就是锁屏完成，不受通话影响
+        if (cur.state == SessionState.LOCK_REQUESTED) {
+            return Transition(
+                cleared(),
+                listOf(
+                    SessionAction.CancelLockWatchdog,
+                    SessionAction.Persist,
+                    SessionAction.UpdateNotification
+                ),
+                "锁屏请求后确认熄屏：到期锁屏完成"
+            )
+        }
+        // 通话接近黑屏：屏幕黑但 keyguard 未接管、设备未锁定——不是会话结束信号（R5）
+        if (ev.inCall && !ev.keyguardLocked && !ev.isDeviceLocked) {
+            return Transition(cur, note = "通话接近黑屏（keyguard 未锁定），忽略（state=${cur.state}）")
         }
         return when (cur.state) {
             SessionState.NO_SESSION -> Transition(cur)
@@ -112,17 +129,8 @@ object SessionMachine {
                 "本次不限中熄屏：会话结束"
             )
 
-            SessionState.LOCK_REQUESTED -> Transition(
-                cleared(),
-                listOf(
-                    SessionAction.CancelLockWatchdog,
-                    SessionAction.Persist,
-                    SessionAction.UpdateNotification
-                ),
-                "锁屏请求后确认熄屏：到期锁屏完成"
-            )
-
-            SessionState.LOCK_FAILED -> Transition(
+            // LOCK_REQUESTED 已在方法开头处理
+            SessionState.LOCK_REQUESTED, SessionState.LOCK_FAILED -> Transition(
                 cleared(),
                 listOf(SessionAction.Persist, SessionAction.UpdateNotification),
                 "锁屏失败后用户自行熄屏：失败状态解除"
@@ -135,12 +143,12 @@ object SessionMachine {
     // ------------------------------------------------------------------
     private fun onUserPresent(cur: SessionSnapshot, ev: SessionEvent.UserPresent): Transition {
         if (ev.keyguardLocked) {
-            // 过期广播：keyguard 实际仍在锁
+            // 过期广播：keyguard 实际仍在锁。控制器负责过渡期复核，此处保持忽略。
             return Transition(cur, note = "USER_PRESENT 到达但 keyguard 仍锁定，忽略")
         }
         return when (cur.state) {
             SessionState.NO_SESSION -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
+                pending(ev.nextSessionId),
                 listOf(
                     SessionAction.Persist,
                     SessionAction.ShowSelectionOverlay,
@@ -155,29 +163,31 @@ object SessionMachine {
                 "待选择中重复 USER_PRESENT，保持待选择"
             )
 
-            SessionState.TIMING -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
-                listOf(
-                    SessionAction.CancelAlarm,
-                    SessionAction.Persist,
-                    SessionAction.ShowSelectionOverlay,
-                    SessionAction.UpdateNotification
-                ),
-                "计时中出现 USER_PRESENT：此前漏记熄屏，旧会话作废并重新选择"
-            )
-
-            SessionState.UNLIMITED -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
-                listOf(
-                    SessionAction.Persist,
-                    SessionAction.ShowSelectionOverlay,
-                    SessionAction.UpdateNotification
-                ),
-                "本次不限中出现 USER_PRESENT：此前漏记熄屏，重新选择"
-            )
+            SessionState.TIMING, SessionState.UNLIMITED -> {
+                // R4：会话开始后短窗口内的重复 USER_PRESENT 是同一解锁周期的迟到/重复广播，
+                // 不得替换会话、取消截止时间或重新触发提醒；只有距会话开始较远的 USER_PRESENT
+                // 才可能是漏记的真实锁屏-再解锁（此时正确语义是旧会话已结束、重新选择）。
+                if (ev.nowElapsed - cur.startedElapsed <= DUPLICATE_UNLOCK_WINDOW_MS) {
+                    Transition(
+                        cur,
+                        note = "USER_PRESENT 距会话开始 ${ev.nowElapsed - cur.startedElapsed}ms，判定同解锁周期重复事件，保持会话"
+                    )
+                } else {
+                    Transition(
+                        pending(ev.nextSessionId),
+                        listOf(
+                            SessionAction.CancelAlarm,
+                            SessionAction.Persist,
+                            SessionAction.ShowSelectionOverlay,
+                            SessionAction.UpdateNotification
+                        ),
+                        "活动中出现 USER_PRESENT：此前漏记锁屏-再解锁，旧会话作废并重新选择"
+                    )
+                }
+            }
 
             SessionState.LOCK_REQUESTED -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
+                pending(ev.nextSessionId),
                 listOf(
                     SessionAction.CancelLockWatchdog,
                     SessionAction.Persist,
@@ -188,7 +198,7 @@ object SessionMachine {
             )
 
             SessionState.LOCK_FAILED -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
+                pending(ev.nextSessionId),
                 listOf(
                     SessionAction.Persist,
                     SessionAction.ShowSelectionOverlay,
@@ -200,7 +210,7 @@ object SessionMachine {
     }
 
     // ------------------------------------------------------------------
-    // 到期闹钟：必须核对会话标识
+    // 到期闹钟：必须核对会话标识；只有到达截止才锁屏（R3）
     // ------------------------------------------------------------------
     private fun onAlarmFired(cur: SessionSnapshot, ev: SessionEvent.AlarmFired): Transition {
         if (cur.state != SessionState.TIMING) {
@@ -212,8 +222,8 @@ object SessionMachine {
                 note = "闹钟会话标识 ${ev.firedSessionId} ≠ 当前 ${cur.sessionId}，忽略旧事件"
             )
         }
-        if (ev.nowElapsed < cur.deadlineElapsed - ALARM_TOLERANCE_MS) {
-            // 闹钟提前触发：按原截止时间重新排定
+        if (ev.nowElapsed < cur.deadlineElapsed) {
+            // 提前触发：按原截止时间重新排定，绝不提前锁屏（R3）
             return Transition(
                 cur,
                 listOf(SessionAction.ScheduleAlarm(cur.sessionId, cur.deadlineElapsed)),
@@ -228,7 +238,22 @@ object SessionMachine {
                 SessionAction.ScheduleLockWatchdog(LOCK_WATCHDOG_MS),
                 SessionAction.UpdateNotification
             ),
-            "到期：发出锁屏请求"
+            "到期：发出锁屏请求（now=${ev.nowElapsed} ≥ deadline=${cur.deadlineElapsed}）"
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // 闹钟排定结果（R7）
+    // ------------------------------------------------------------------
+    private fun onAlarmScheduleOutcome(cur: SessionSnapshot, ev: SessionEvent.AlarmScheduleOutcome): Transition {
+        if (cur.state != SessionState.TIMING || ev.sessionId != cur.sessionId) {
+            return Transition(cur, note = "闹钟排定结果与当前会话不符，忽略")
+        }
+        if (ev.ok == cur.alarmScheduled) return Transition(cur)
+        return Transition(
+            cur.copy(alarmScheduled = ev.ok),
+            listOf(SessionAction.Persist, SessionAction.UpdateNotification),
+            if (ev.ok) "到期闹钟排定成功" else "到期闹钟排定失败：启用进程内兜底检查并在通知中警示"
         )
     }
 
@@ -272,7 +297,8 @@ object SessionMachine {
                 cur.copy(
                     state = SessionState.TIMING,
                     startedElapsed = ev.nowElapsed,
-                    deadlineElapsed = deadline
+                    deadlineElapsed = deadline,
+                    alarmScheduled = true
                 ),
                 listOf(
                     SessionAction.Persist,
@@ -286,9 +312,12 @@ object SessionMachine {
     }
 
     // ------------------------------------------------------------------
-    // 锁屏结果与看门狗
+    // 锁屏结果与看门狗：旧会话回传不消费（R1）
     // ------------------------------------------------------------------
     private fun onLockOutcome(cur: SessionSnapshot, ev: SessionEvent.LockOutcome): Transition {
+        if (ev.sessionId != cur.sessionId) {
+            return Transition(cur, note = "LockOutcome 会话 ${ev.sessionId} ≠ 当前 ${cur.sessionId}，忽略旧事件")
+        }
         return when (cur.state) {
             SessionState.LOCK_REQUESTED ->
                 if (ev.success) {
@@ -323,6 +352,9 @@ object SessionMachine {
 
     private fun onLockWatchdog(cur: SessionSnapshot, ev: SessionEvent.LockWatchdog): Transition {
         if (cur.state != SessionState.LOCK_REQUESTED) return Transition(cur)
+        if (ev.sessionId != cur.sessionId) {
+            return Transition(cur, note = "看门狗会话 ${ev.sessionId} ≠ 当前 ${cur.sessionId}，忽略旧事件")
+        }
         return Transition(
             cur.copy(
                 state = SessionState.LOCK_FAILED,
@@ -334,21 +366,33 @@ object SessionMachine {
     }
 
     // ------------------------------------------------------------------
-    // 恢复：开机、服务重启、进程恢复后核对当前设备状态
+    // 恢复：开机、服务重启、进程恢复后核对当前设备状态（R6：新开机+已解锁也补待选择）
     // ------------------------------------------------------------------
     private fun onRecover(cur: SessionSnapshot, ev: SessionEvent.Recover): Transition {
         if (!ev.sameBoot) {
-            return Transition(
-                cleared(),
-                listOf(
-                    SessionAction.CancelAlarm,
-                    SessionAction.CancelLockWatchdog,
-                    SessionAction.HideSelectionOverlay,
-                    SessionAction.Persist,
-                    SessionAction.UpdateNotification
-                ),
-                "恢复检查：检测到重启，旧会话（id=${cur.sessionId}）作废"
+            // 重启：旧开机的一切任务作废，绝不复用旧 elapsedRealtime 截止时间
+            val clearedActions = mutableListOf<SessionAction>(
+                SessionAction.CancelAlarm,
+                SessionAction.CancelLockWatchdog,
+                SessionAction.HideSelectionOverlay,
+                SessionAction.Persist,
+                SessionAction.UpdateNotification
             )
+            // R6：若此刻已解锁且允许建会话，直接补上待选择，不等下一次解锁
+            return if (ev.interactive && !ev.keyguardLocked && ev.canCreateSession) {
+                Transition(
+                    pending(ev.nextSessionId),
+                    clearedActions + listOf(SessionAction.ShowSelectionOverlay),
+                    "恢复检查：检测到重启，旧会话（id=${cur.sessionId}）作废；当前已解锁，补上待选择"
+                )
+            } else {
+                Transition(
+                    cleared(),
+                    clearedActions,
+                    "恢复检查：检测到重启，旧会话（id=${cur.sessionId}）作废" +
+                        if (ev.interactive && !ev.keyguardLocked) "（能力未就绪，不建会话）" else ""
+                )
+            }
         }
         val locked = !ev.interactive || ev.keyguardLocked
         if (locked) {
@@ -367,15 +411,21 @@ object SessionMachine {
         }
         // 已交互且未锁屏
         return when (cur.state) {
-            SessionState.NO_SESSION -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
-                listOf(
-                    SessionAction.Persist,
-                    SessionAction.ShowSelectionOverlay,
-                    SessionAction.UpdateNotification
-                ),
-                "恢复检查：已解锁但无会话，补上待选择"
-            )
+            SessionState.NO_SESSION -> {
+                if (!ev.canCreateSession) {
+                    Transition(cur, note = "恢复检查：已解锁但能力未就绪，不创建待选择")
+                } else {
+                    Transition(
+                        pending(ev.nextSessionId),
+                        listOf(
+                            SessionAction.Persist,
+                            SessionAction.ShowSelectionOverlay,
+                            SessionAction.UpdateNotification
+                        ),
+                        "恢复检查：已解锁但无会话，补上待选择"
+                    )
+                }
+            }
 
             SessionState.PENDING_SELECTION -> Transition(
                 cur,
@@ -384,16 +434,8 @@ object SessionMachine {
             )
 
             SessionState.TIMING -> {
-                if (ev.nowElapsed + ALARM_TOLERANCE_MS < cur.deadlineElapsed) {
-                    Transition(
-                        cur,
-                        listOf(
-                            SessionAction.ScheduleAlarm(cur.sessionId, cur.deadlineElapsed),
-                            SessionAction.UpdateNotification
-                        ),
-                        "恢复检查：计时会话沿用原截止时间 ${cur.deadlineElapsed}（剩余 ${cur.deadlineElapsed - ev.nowElapsed}ms）"
-                    )
-                } else {
+                // R3：只有到达截止才执行到期处理，不用容差提前锁屏
+                if (ev.nowElapsed >= cur.deadlineElapsed) {
                     Transition(
                         cur.copy(state = SessionState.LOCK_REQUESTED),
                         listOf(
@@ -402,7 +444,16 @@ object SessionMachine {
                             SessionAction.ScheduleLockWatchdog(LOCK_WATCHDOG_MS),
                             SessionAction.UpdateNotification
                         ),
-                        "恢复检查：计时会话已过期，执行到期锁屏"
+                        "恢复检查：计时会话已过期（now=${ev.nowElapsed} ≥ deadline=${cur.deadlineElapsed}），执行到期锁屏"
+                    )
+                } else {
+                    Transition(
+                        cur,
+                        listOf(
+                            SessionAction.ScheduleAlarm(cur.sessionId, cur.deadlineElapsed),
+                            SessionAction.UpdateNotification
+                        ),
+                        "恢复检查：计时会话沿用原截止时间 ${cur.deadlineElapsed}（剩余 ${cur.deadlineElapsed - ev.nowElapsed}ms）"
                     )
                 }
             }
@@ -424,25 +475,35 @@ object SessionMachine {
                 "恢复检查：锁屏请求未确认且屏幕已亮，重新请求锁屏"
             )
 
-            SessionState.LOCK_FAILED -> Transition(
-                pending(ev.nextSessionId, elapsedZero()),
-                listOf(
-                    SessionAction.Persist,
-                    SessionAction.ShowSelectionOverlay,
-                    SessionAction.UpdateNotification
-                ),
-                "恢复检查：锁屏失败且屏幕已亮，重新选择"
-            )
+            SessionState.LOCK_FAILED -> {
+                if (!ev.canCreateSession) {
+                    Transition(
+                        cleared(),
+                        listOf(SessionAction.Persist, SessionAction.UpdateNotification),
+                        "恢复检查：锁屏失败且屏幕已亮，但能力未就绪，回到无会话"
+                    )
+                } else {
+                    Transition(
+                        pending(ev.nextSessionId),
+                        listOf(
+                            SessionAction.Persist,
+                            SessionAction.ShowSelectionOverlay,
+                            SessionAction.UpdateNotification
+                        ),
+                        "恢复检查：锁屏失败且屏幕已亮，重新选择"
+                    )
+                }
+            }
         }
     }
 
     // ------------------------------------------------------------------
     // 工具
     // ------------------------------------------------------------------
-    private fun pending(id: Long, now: Long): SessionSnapshot = SessionSnapshot(
+    private fun pending(id: Long): SessionSnapshot = SessionSnapshot(
         state = SessionState.PENDING_SELECTION,
         sessionId = id,
-        startedElapsed = now,
+        startedElapsed = 0L,
         deadlineElapsed = 0L,
         lockError = null
     )
@@ -454,10 +515,6 @@ object SessionMachine {
         deadlineElapsed = 0L,
         lockError = null
     )
-
-    /** 恢复/新建会话时尚无“当前时刻”的场景占位：由调用方在执行 Persist 前不必修正，
-     *  startedElapsed 仅用于展示，等待选择结束才写入真实开始时刻 */
-    private fun elapsedZero(): Long = 0L
 
     private fun addSaturating(a: Long, b: Long): Long =
         try {

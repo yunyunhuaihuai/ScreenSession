@@ -17,7 +17,7 @@ import java.util.Locale
  * 设备交互／锁屏状态、管理员状态、锁屏请求和恢复原因。
  * 不记录系统密码、其他应用内容或个人数据。
  */
-class Diagnostics private constructor(private val logDir: File) {
+class Diagnostics private constructor(private val logDir: File) : com.local.unlocksession.core.DiagSink {
 
     private val lock = Any()
     private val timeFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
@@ -26,7 +26,7 @@ class Diagnostics private constructor(private val logDir: File) {
         File(context.filesDir, "diag").apply { mkdirs() }
     )
 
-    fun log(tag: String, message: String) {
+    override fun log(tag: String, message: String) {
         val line = buildString {
             append(timeFmt.format(Date()))
             append('|').append(SystemClock.elapsedRealtime())

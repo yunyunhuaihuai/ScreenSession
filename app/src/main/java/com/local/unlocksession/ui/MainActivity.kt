@@ -11,19 +11,21 @@ import android.provider.Settings
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.local.unlocksession.App
 import com.local.unlocksession.BuildConfig
 import com.local.unlocksession.R
+import com.local.unlocksession.core.SessionNotifier
 import com.local.unlocksession.lock.LockController
-import com.local.unlocksession.logic.DurationInput
+import com.local.unlocksession.logic.ReminderPlanner
 import com.local.unlocksession.logic.SessionSnapshot
 import com.local.unlocksession.logic.SessionState
 
 /**
- * 主界面：状态展示、首次授权集中处理、快捷时长编辑、诊断入口。
+ * 主界面：状态展示、首次授权集中处理、通知与提醒设置、快捷时长编辑、诊断入口。
  *
  * 会话进行中不提供任何停止/重置/延长入口——监控开关同样被锁定，
  * 防止通过普通设置间接取消本次计时。
@@ -44,6 +46,13 @@ class MainActivity : Activity() {
     private lateinit var autostartBtn: Button
     private lateinit var monitorSwitch: Switch
     private lateinit var monitorHint: TextView
+    private lateinit var countdownSwitch: Switch
+    private lateinit var remindersSwitch: Switch
+    private lateinit var reminderList: LinearLayout
+    private lateinit var reminderInput: EditText
+    private lateinit var reminderTestBtn: Button
+    private lateinit var notifSettingsBtn: Button
+    private lateinit var notifStatusText: TextView
     private lateinit var quickEdits: List<EditText>
     private lateinit var quickSaveBtn: Button
     private lateinit var debugSecondsSwitch: Switch
@@ -81,6 +90,13 @@ class MainActivity : Activity() {
         autostartBtn = findViewById(R.id.perm_autostart_btn)
         monitorSwitch = findViewById(R.id.monitor_switch)
         monitorHint = findViewById(R.id.monitor_hint)
+        countdownSwitch = findViewById(R.id.countdown_switch)
+        remindersSwitch = findViewById(R.id.reminders_switch)
+        reminderList = findViewById(R.id.reminder_list)
+        reminderInput = findViewById(R.id.reminder_input)
+        reminderTestBtn = findViewById(R.id.reminder_test_btn)
+        notifSettingsBtn = findViewById(R.id.notif_settings_btn)
+        notifStatusText = findViewById(R.id.notif_status_text)
         quickEdits = listOf(
             findViewById(R.id.quick_edit0),
             findViewById(R.id.quick_edit1),
@@ -90,6 +106,12 @@ class MainActivity : Activity() {
         debugCard = findViewById(R.id.debug_card)
         debugSecondsSwitch = findViewById(R.id.debug_seconds_switch)
         versionText = findViewById(R.id.version_text)
+
+        // R8：初次进入回填已保存的快捷时长；旋转/重建后由系统恢复用户输入
+        if (savedInstanceState == null) {
+            val saved = controller.quickMinutes()
+            quickEdits.forEachIndexed { i, e -> e.setText(saved.getOrNull(i)?.toString() ?: "") }
+        }
 
         adminBtn.setOnClickListener {
             try {
@@ -135,6 +157,23 @@ class MainActivity : Activity() {
 
         quickSaveBtn.setOnClickListener { saveQuickMinutes() }
 
+        // ---- 通知与提醒 ----
+        countdownSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked != controller.isShowCountdown()) {
+                controller.setShowCountdown(checked)
+                toast(if (checked) "倒计时显示已开启" else "倒计时不显示，监控运行通知保留")
+            }
+        }
+        remindersSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked != controller.isRemindersEnabled()) {
+                controller.setRemindersEnabled(checked)
+                toast("提前提醒${if (checked) "开启" else "关闭"}，从下次会话生效")
+            }
+        }
+        findViewById<Button>(R.id.reminder_add_btn).setOnClickListener { addReminderThreshold() }
+        reminderTestBtn.setOnClickListener { sendTestReminder() }
+        notifSettingsBtn.setOnClickListener { openNotificationSettings() }
+
         findViewById<Button>(R.id.diag_view_btn).setOnClickListener {
             startActivity(Intent(this, LogActivity::class.java))
         }
@@ -173,6 +212,7 @@ class MainActivity : Activity() {
         renderStatus(controller.snapshot)
         renderPermissions()
         renderMonitorSwitch()
+        renderNotificationCard()
         if (controller.snapshot.isTiming) uiHandler.post(tickRunnable)
     }
 
@@ -198,7 +238,8 @@ class MainActivity : Activity() {
             "，剩余 ${com.local.unlocksession.util.Format.remaining(ms)}"
         } else ""
         statusText.text = "状态：$label（会话 #${s.sessionId}）$remain" +
-            (s.lockError?.let { "，错误：$it" } ?: "")
+            (s.lockError?.let { "，错误：$it" } ?: "") +
+            if (s.isTiming && !s.alarmScheduled) "，⚠ 到期闹钟设置失败（备用检查运行中）" else ""
 
         warningText.visibility =
             if (LockController.isKeyguardSecure(this)) View.GONE else View.VISIBLE
@@ -244,6 +285,147 @@ class MainActivity : Activity() {
         }
         monitorHint.visibility = if (busy) View.VISIBLE else View.GONE
     }
+
+    // ------------------------------------------------------------------
+    // 通知与提醒
+    // ------------------------------------------------------------------
+
+    private fun renderNotificationCard() {
+        countdownSwitch.setOnCheckedChangeListener(null)
+        countdownSwitch.isChecked = controller.isShowCountdown()
+        remindersSwitch.setOnCheckedChangeListener(null)
+        remindersSwitch.isChecked = controller.isRemindersEnabled()
+        countdownSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked != controller.isShowCountdown()) {
+                controller.setShowCountdown(checked)
+                toast(if (checked) "倒计时显示已开启" else "倒计时不显示，监控运行通知保留")
+            }
+        }
+        remindersSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked != controller.isRemindersEnabled()) {
+                controller.setRemindersEnabled(checked)
+                toast("提前提醒${if (checked) "开启" else "关闭"}，从下次会话生效")
+            }
+        }
+        rebuildReminderList()
+        renderNotificationStatus()
+    }
+
+    private fun rebuildReminderList() {
+        reminderList.removeAllViews()
+        val thresholds = controller.reminderThresholds()
+        if (thresholds.isEmpty()) {
+            val empty = TextView(this).apply {
+                text = "（无提醒时点）"
+                textSize = 13f
+                setTextColor(getColor(R.color.text_sub))
+            }
+            reminderList.addView(empty)
+            return
+        }
+        for (t in thresholds) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(0, 4, 0, 4)
+            }
+            val label = TextView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                text = "${t} 秒（${ReminderPlanner.humanize(t)}）"
+                textSize = 14f
+                setTextColor(getColor(R.color.text_main))
+            }
+            val del = Button(this).apply {
+                text = "删除"
+                textSize = 12f
+                setOnClickListener {
+                    val cur = controller.reminderThresholds().toMutableList()
+                    cur.remove(t)
+                    if (!controller.setReminderThresholds(cur)) toast("保存失败")
+                    rebuildReminderList()
+                }
+            }
+            row.addView(label)
+            row.addView(del)
+            reminderList.addView(row)
+        }
+    }
+
+    private fun addReminderThreshold() {
+        val raw = reminderInput.text?.toString()?.trim().orEmpty()
+        if (raw.isEmpty()) {
+            toast(getString(R.string.reminder_invalid))
+            return
+        }
+        val v = raw.toLongOrNull()
+        val cur = controller.reminderThresholds()
+        if (v == null || v < 1 || v > 172800 || cur.contains(v)) {
+            toast(getString(R.string.reminder_invalid))
+            return
+        }
+        if (controller.setReminderThresholds(cur + v)) {
+            reminderInput.setText("")
+            rebuildReminderList()
+            toast("已添加，从下次会话生效")
+        } else {
+            toast("保存失败")
+        }
+    }
+
+    private fun sendTestReminder() {
+        val ok = controller.testReminder()
+        when {
+            ok -> toast(getString(R.string.reminder_test_sent))
+            !controller.notificationsEnabledForUi() -> {
+                toast(getString(R.string.reminder_test_disabled))
+                openNotificationSettings()
+            }
+            else -> toast(getString(R.string.reminder_test_throttled))
+        }
+    }
+
+    private fun renderNotificationStatus() {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val sb = StringBuilder()
+        if (!nm.areNotificationsEnabled()) {
+            sb.append("⚠ 应用通知已被系统关闭，倒计时与提醒都无法呈现")
+        } else {
+            val ch = nm.getNotificationChannel(SessionNotifier.CHANNEL_REMINDER)
+            when {
+                ch == null -> sb.append("提醒渠道未创建")
+                ch.importance == android.app.NotificationManager.IMPORTANCE_NONE ->
+                    sb.append("⚠ 提前提醒渠道已被关闭")
+                !ch.shouldVibrate() ->
+                    sb.append("⚠ 提前提醒渠道震动已被关闭（横幅仍会出现）")
+                else -> sb.append("通知正常；提醒渠道：高重要性、震动开")
+            }
+            sb.append("。勿扰/ColorOS 横幅策略可能影响横幅实际出现")
+        }
+        notifStatusText.text = sb.toString()
+        notifStatusText.setTextColor(
+            getColor(if (sb.startsWith("⚠")) R.color.warn else R.color.text_sub)
+        )
+    }
+
+    private fun openNotificationSettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            )
+        } catch (e: Exception) {
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(Uri.parse("package:$packageName"))
+                )
+            } catch (e2: Exception) {
+                toast("无法打开系统通知设置：${e2.message}")
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
 
     private fun saveQuickMinutes() {
         val values = quickEdits.map { it.text?.toString()?.trim()?.toIntOrNull() ?: -1 }

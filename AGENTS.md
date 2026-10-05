@@ -6,4 +6,4 @@
 - 目标设备用 `adb -s b185de42` 指定；ColorOS 侧载安装会弹"USB 安装"确认页，需点击"继续安装"。
 - 测试/取证数据放 `..\ScreenSession_Data\`（不入库）；本仓库 `git status` 应保持干净。
 - 状态机改动必须同步补 `app/src/test`（纯 JVM 测试）；真机行为验证后把日志拉到 `_Data` 归档。
-- 不要推送到远端（当前未配置远端，用户未授权推送）。
+- 远端为 https://github.com/yunyunhuaihuai/ScreenSession（origin 已配置）。执行约定：**不自动推送远端**，用户明确要求推送或 PR 时才执行；本仓库在功能分支上开发，不自动合并 main。
