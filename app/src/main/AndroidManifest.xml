@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- 引导用户加入电池优化白名单（ColorOS 后台保活） -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 提前提醒短震动（API 29 普通权限，无运行时授权） -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name=".App"
@@ -49,6 +51,11 @@
         <!-- 到期精确闹钟 -->
         <receiver
             android:name=".service.SessionAlarmReceiver"
+            android:exported="false" />
+
+        <!-- 提前提醒精确闹钟 -->
+        <receiver
+            android:name=".service.ReminderReceiver"
             android:exported="false" />
 
         <!-- 最小设备管理员：仅 force-lock，用于 DevicePolicyManager.lockNow() -->

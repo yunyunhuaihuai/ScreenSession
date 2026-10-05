@@ -53,6 +53,17 @@ object LockController {
         return km.isKeyguardLocked
     }
 
+    /** 设备是否处于需要系统凭据的强锁定状态（密码解锁过渡期判定用） */
+    fun isDeviceLocked(context: Context): Boolean {
+        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+            ?: return false
+        return try {
+            km.isDeviceLocked
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     /**
      * 发出锁屏请求。返回 (已发出, 错误)。
      * 这里只证明调用未抛异常；确认熄屏由状态机在收到 SCREEN_OFF 后完成。

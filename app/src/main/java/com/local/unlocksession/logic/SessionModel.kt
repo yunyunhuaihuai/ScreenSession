@@ -18,7 +18,7 @@ enum class SessionState {
     /** 正在计时：截止时间已固定，只允许查看状态 */
     TIMING,
 
-    /** 本次不限：不创建到期任务，锁屏后结束 */
+    /** 本次不限：不创建到期任务，提前提醒，锁屏后结束 */
     UNLIMITED,
 
     /** 已发出锁屏请求：lockNow() 已调用，等待系统熄屏确认 */
@@ -38,7 +38,13 @@ data class SessionSnapshot(
     /** 截止时刻的 elapsedRealtime，毫秒；0 表示无截止 */
     val deadlineElapsed: Long = 0L,
     /** 锁屏失败原因；仅 LOCK_FAILED 状态非空 */
-    val lockError: String? = null
+    val lockError: String? = null,
+    /** 到期闹钟是否成功排定；false 表示系统闹钟设置失败，依赖进程内兜底检查 */
+    val alarmScheduled: Boolean = true,
+    /** 本次会话的提前提醒配置快照（确认计时那一刻的设置，此后不受全局设置影响） */
+    val sessionRemindersEnabled: Boolean = true,
+    /** 本次会话的提前提醒时点快照（秒，已规范化：正数、去重、升序） */
+    val sessionReminderThresholds: List<Long> = emptyList()
 ) {
     val isTiming: Boolean get() = state == SessionState.TIMING
     val isUnlimited: Boolean get() = state == SessionState.UNLIMITED
@@ -48,7 +54,6 @@ data class SessionSnapshot(
 
 /** 状态机输入事件。事件必须携带处理时刻的设备事实，由调用方（SessionController）采集 */
 sealed class SessionEvent {
-    /** ACTION_SCREEN_ON：只亮屏不算解锁 */
     data class ScreenOn(
         val interactive: Boolean,
         val keyguardLocked: Boolean,
@@ -56,17 +61,34 @@ sealed class SessionEvent {
         val nextSessionId: Long
     ) : SessionEvent()
 
-    /** inCall：通话中的接近传感器熄屏等场景，状态机会整体忽略 */
-    data class ScreenOff(val keyguardSecure: Boolean, val inCall: Boolean) : SessionEvent()
+    /**
+     * ACTION_SCREEN_OFF。
+     * keyguardLocked/isDeviceLocked 用于区分“通话接近黑屏（keyguard 未接管）”与“真实锁屏”；
+     * 到期锁屏确认（LOCK_REQUESTED 状态）不受 inCall 影响。
+     */
+    data class ScreenOff(
+        val keyguardLocked: Boolean,
+        val isDeviceLocked: Boolean,
+        val keyguardSecure: Boolean,
+        val inCall: Boolean
+    ) : SessionEvent()
 
     /**
      * ACTION_USER_PRESENT（keyguard 真正消失）。
      * nextSessionId 由调用方从仓库预取：状态机需要新建会话时使用该值。
+     * nowElapsed 用于判定“同解锁周期的重复/迟到事件”（R4）。
      */
-    data class UserPresent(val keyguardLocked: Boolean, val nextSessionId: Long) : SessionEvent()
+    data class UserPresent(
+        val keyguardLocked: Boolean,
+        val nextSessionId: Long,
+        val nowElapsed: Long
+    ) : SessionEvent()
 
     /** 到期闹钟触发；firedSessionId 用于旧会话事件校验 */
     data class AlarmFired(val firedSessionId: Long, val nowElapsed: Long) : SessionEvent()
+
+    /** 到期闹钟排定结果回传（R7：失败时如实展示，不允许假装计时可靠） */
+    data class AlarmScheduleOutcome(val sessionId: Long, val ok: Boolean) : SessionEvent()
 
     /** 用户做出选择；pendingSessionId 必须与当前待选择会话一致 */
     data class Selected(
@@ -76,20 +98,27 @@ sealed class SessionEvent {
         val nowElapsed: Long
     ) : SessionEvent()
 
-    /** lockNow() 调用结果回传 */
-    data class LockOutcome(val success: Boolean, val error: String?, val nowElapsed: Long) : SessionEvent()
+    /** lockNow() 调用结果回传；必须携带会话标识，旧会话结果不消费（R1） */
+    data class LockOutcome(
+        val sessionId: Long,
+        val success: Boolean,
+        val error: String?,
+        val nowElapsed: Long
+    ) : SessionEvent()
 
-    /** 锁屏看门狗：发出锁屏请求后迟迟未见熄屏 */
-    data class LockWatchdog(val nowElapsed: Long) : SessionEvent()
+    /** 锁屏看门狗：发出锁屏请求后迟迟未见熄屏；携带会话标识（R1） */
+    data class LockWatchdog(val sessionId: Long, val nowElapsed: Long) : SessionEvent()
 
     /**
      * 恢复检查（开机、服务重启、进程恢复、应用更新后）。
-     * sameBoot 表示持久化快照是否与本机当前开机属于同一次开机。
+     * sameBoot 表示持久化快照是否与本机当前开机属于同一次开机；
+     * canCreateSession 由控制器能力门（监控开/管理员/悬浮窗）决定，false 时不得新建待选择。
      */
     data class Recover(
         val interactive: Boolean,
         val keyguardLocked: Boolean,
         val sameBoot: Boolean,
+        val canCreateSession: Boolean,
         val nowElapsed: Long,
         val nextSessionId: Long
     ) : SessionEvent()
@@ -159,4 +188,27 @@ object DurationInput {
         if (!digitsOnly.matches(trimmed)) return null
         return trimmed.toLongOrNull() ?: return null
     }
+}
+
+/** 提前提醒时点输入：整数秒，范围沿用会话时长上限（48h），去重后升序 */
+object ReminderInput {
+    fun parseList(raw: String?): List<Long>? {
+        if (raw.isNullOrBlank()) return null
+        val parts = raw.split(',', '，', ' ')
+        val out = ArrayList<Long>()
+        for (p in parts) {
+            val t = p.trim()
+            if (t.isEmpty()) continue
+            if (!digitsOnlySafe(t)) return null
+            val v = t.toLongOrNull() ?: return null
+            if (v < 1 || v > DurationInput.MAX_MINUTES * 60) return null
+            if (v in out) return null // 重复值明确拒绝
+            out.add(v)
+        }
+        if (out.isEmpty()) return null
+        out.sort()
+        return out
+    }
+
+    private fun digitsOnlySafe(t: String): Boolean = t.matches(Regex("^\\d+$"))
 }

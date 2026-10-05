@@ -1,28 +1,13 @@
 package com.local.unlocksession.core
 
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.Context
-import android.content.Intent
-import android.os.Handler
-import android.os.Looper
-import android.os.PowerManager
-import android.os.SystemClock
-import android.provider.Settings
-import com.local.unlocksession.data.SessionRepository
-import com.local.unlocksession.diag.Diagnostics
-import com.local.unlocksession.lock.LockController
-import com.local.unlocksession.logic.DurationInput
-import com.local.unlocksession.logic.SessionEvent
+import com.local.unlocksession.data.SessionStore
+import com.local.unlocksession.session.SessionPanelBridge
+import com.local.unlocksession.logic.ReminderPlanner
 import com.local.unlocksession.logic.SessionAction
+import com.local.unlocksession.logic.SessionEvent
 import com.local.unlocksession.logic.SessionMachine
 import com.local.unlocksession.logic.SessionSnapshot
 import com.local.unlocksession.logic.SessionState
-import com.local.unlocksession.overlay.SelectionOverlay
-import com.local.unlocksession.service.SessionAlarmReceiver
-import com.local.unlocksession.service.UnlockMonitorService
-import com.local.unlocksession.session.SessionPanelBridge
-import com.local.unlocksession.util.Format
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -32,19 +17,26 @@ import java.util.concurrent.Executors
  * 是状态机唯一的调用方和所有副作用的唯一执行方。
  *
  * 事件顺序：单线程执行器保证 FIFO；ScreenOff/UserPresent 等信号的设备事实
- * （是否交互、keyguard 是否锁定、是否通话中）在处理时刻读取，避免广播陈旧值。
+ * 在处理时刻通过 [ControllerEnv] 读取，避免广播陈旧值。
+ *
+ * 可靠性设计：
+ * - R0：USER_PRESENT 到达但 keyguard 仍锁（密码解锁过渡期）→ 有限次数、可取消的短延迟复核；
+ * - R1：锁屏请求/看门狗/重试全部携带会话标识并在执行前核对，会话结束即取消；
+ * - R2：到期/提醒接收器经 goAsync 提交，冷启动先恢复核对开机归属与真实锁屏状态；
+ * - R7：闹钟排定失败如实回传，进程内每秒兜底检查经同一状态机触发到期事件。
  */
-class SessionController(
-    private val appContext: Context,
-    private val repo: SessionRepository,
-    private val diag: Diagnostics
+class SessionController internal constructor(
+    private val repo: SessionStore,
+    private val diag: DiagSink,
+    private val env: ControllerEnv,
+    private val executor: ExecutorService
 ) {
 
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "session-controller").apply { isDaemon = false }
-    }
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val notifier = SessionNotifier(appContext)
+    /** 生产入口：独立单线程执行器，保证事件 FIFO 串行 */
+    constructor(repo: SessionStore, diag: DiagSink, env: ControllerEnv) : this(
+        repo, diag, env, defaultExecutor()
+    )
+
     private val panelBridge = SessionPanelBridge(this)
 
     @Volatile
@@ -58,8 +50,13 @@ class SessionController(
 
     private var started = false
     private var lockRetries = 0
-    private var watchdogToken: Runnable? = null
-    private var tickToken: Runnable? = null
+    private var lastTickTrace = 0L
+
+    /** R0：keyguard 过渡期复核的代次，熄屏/新广播即作废旧复核 */
+    private var recheckGeneration = 0L
+
+    /** 测试提醒节流 */
+    private var lastTestReminderAt = 0L
 
     private val uiListeners = CopyOnWriteArrayList<(SessionSnapshot) -> Unit>()
 
@@ -70,31 +67,24 @@ class SessionController(
     fun startIfNeeded() {
         if (started) return
         started = true
-        diag.attachContext(appContext)
         snapshot = repo.loadSnapshot()
-        notifier.ensureChannels()
-        diag.log("INIT", "控制器启动: ${Diagnostics.deviceInfoLine(appContext)} 恢复快照=${snapshot}")
+        diag.log("INIT", "控制器启动 boot=${env.bootCount()} 恢复快照=$snapshot")
     }
 
     fun attachService(service: android.app.Service) {
         startIfNeeded()
-        notifier.attach(service)
-    }
-
-    /** 服务 onCreate/onStartCommand 时立即刷新前台通知（满足 5 秒内 startForeground 要求） */
-    fun refreshServiceNotification() {
-        startIfNeeded()
-        notifier.update(snapshot)
+        env.attachForegroundService(service)
+        env.notifySession(snapshot, repo.isShowCountdown())
     }
 
     fun detachService(service: android.app.Service) {
-        notifier.detach()
+        env.detachForegroundService(service)
         diag.log("SVC", "前台服务 detached（系统可能稍后重启服务）")
     }
 
     fun addUiListener(listener: (SessionSnapshot) -> Unit) {
         uiListeners.add(listener)
-        mainHandler.post { listener(snapshot) }
+        env.postUi { listener(snapshot) }
     }
 
     fun removeUiListener(listener: (SessionSnapshot) -> Unit) {
@@ -108,19 +98,28 @@ class SessionController(
     fun signalScreenOn() = submit {
         startIfNeeded()
         val ev = SessionEvent.ScreenOn(
-            interactive = isInteractive(),
-            keyguardLocked = LockController.isKeyguardLocked(appContext),
+            interactive = env.isInteractive(),
+            keyguardLocked = keyguardLockedFact(),
             nextSessionId = repo.peekNextSessionId()
         )
         if (gateIfNeeded(ev)) return@submit
         process(ev)
+        // 亮屏期间启动一致性心跳：宽限期内无凭据放行不产生任何广播（实测 ColorOS 上滑
+        // 放行连 USER_PRESENT 都不发），必须靠心跳发现"已解锁却无会话"的不一致状态
+        if (env.isInteractive()) startUnlockHeartbeat()
     }
 
     fun signalScreenOff() = submit {
         startIfNeeded()
+        // 真实锁屏周期开始：作废一切进行中的 keyguard 复核
+        recheckGeneration++
+        env.cancelDelayed(KEY_KG_RECHECK)
+        env.cancelDelayed(KEY_HEARTBEAT)
         val ev = SessionEvent.ScreenOff(
-            keyguardSecure = LockController.isKeyguardSecure(appContext),
-            inCall = isInCall()
+            keyguardLocked = keyguardLockedFact(),
+            isDeviceLocked = env.isDeviceLocked(),
+            keyguardSecure = env.isKeyguardSecure(),
+            inCall = env.isInCall()
         )
         process(ev)
     }
@@ -128,16 +127,80 @@ class SessionController(
     fun signalUserPresent() = submit {
         startIfNeeded()
         val ev = SessionEvent.UserPresent(
-            keyguardLocked = LockController.isKeyguardLocked(appContext),
-            nextSessionId = repo.peekNextSessionId()
+            keyguardLocked = keyguardLockedFact(),
+            nextSessionId = repo.peekNextSessionId(),
+            nowElapsed = env.nowElapsed()
         )
         if (gateIfNeeded(ev)) return@submit
+        if (ev.keyguardLocked) {
+            // R0：密码解锁时 keyguard 消失动画/状态翻转可能慢于广播，
+            // 做有限次数、可取消的事实复核；实际未锁且可交互后再创建待选择。
+            startKeyguardRecheck()
+            return@submit
+        }
         process(ev)
     }
 
     fun signalAlarm(firedSessionId: Long) = submit {
         startIfNeeded()
-        process(SessionEvent.AlarmFired(firedSessionId, SystemClock.elapsedRealtime()))
+        if (!verifyColdStart("到期闹钟")) return@submit
+        process(SessionEvent.AlarmFired(firedSessionId, env.nowElapsed()))
+    }
+
+    /** R2：接收器经 goAsync 提交；完成回调覆盖提交后的一切路径 */
+    fun handleAlarmAsync(firedSessionId: Long, onFinished: () -> Unit) {
+        try {
+            executor.execute {
+                try {
+                    startIfNeeded()
+                    if (verifyColdStart("到期闹钟")) {
+                        process(SessionEvent.AlarmFired(firedSessionId, env.nowElapsed()))
+                    }
+                } catch (e: Exception) {
+                    diag.log("ERR", "到期事件处理异常: ${e.javaClass.simpleName}: ${e.message}")
+                } finally {
+                    try {
+                        onFinished()
+                    } catch (e: Exception) {
+                        diag.log("ERR", "广播 finish 异常: ${e.message}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // 执行器已关闭等提交失败路径：也必须结束广播生命周期
+            diag.log("ERR", "到期事件提交失败: ${e.message}")
+            try {
+                onFinished()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 提醒闹钟到达：冷启动核对 → 迟到窗口判定 → 消费标记先行 → heads-up 投递 */
+    fun handleReminderAsync(firedSessionId: Long, thresholdMs: Long, onFinished: () -> Unit) {
+        try {
+            executor.execute {
+                try {
+                    startIfNeeded()
+                    if (!verifyColdStart("提前提醒")) return@execute
+                    processReminder(firedSessionId, thresholdMs)
+                } catch (e: Exception) {
+                    diag.log("ERR", "提醒处理异常: ${e.javaClass.simpleName}: ${e.message}")
+                } finally {
+                    try {
+                        onFinished()
+                    } catch (e: Exception) {
+                        diag.log("ERR", "广播 finish 异常: ${e.message}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            diag.log("ERR", "提醒事件提交失败: ${e.message}")
+            try {
+                onFinished()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     /**
@@ -146,24 +209,23 @@ class SessionController(
      */
     fun recover(reason: String) = submit {
         startIfNeeded()
-        val interactive = isInteractive()
-        val keyguardLocked = LockController.isKeyguardLocked(appContext)
+        val interactive = env.isInteractive()
+        val keyguardLocked = keyguardLockedFact()
         val sameBoot = computeSameBoot()
         diag.log(
             "RECOVER",
             "原因=$reason interactive=$interactive keyguardLocked=$keyguardLocked " +
-                "sameBoot=$sameBoot (savedBoot=${repo.savedBootCount()} currentBoot=${Diagnostics.bootCount(appContext)} " +
-                "savedElapsed=${repo.savedElapsed()} nowElapsed=${SystemClock.elapsedRealtime()}) " +
-                "persisted=${snapshot}"
+                "sameBoot=$sameBoot (savedBoot=${repo.savedBootCount()} currentBoot=${env.bootCount()} " +
+                "savedElapsed=${repo.savedElapsed()} nowElapsed=${env.nowElapsed()}) persisted=$snapshot"
         )
         val ev = SessionEvent.Recover(
             interactive = interactive,
             keyguardLocked = keyguardLocked,
             sameBoot = sameBoot,
-            nowElapsed = SystemClock.elapsedRealtime(),
+            canCreateSession = capabilityGate() == null,
+            nowElapsed = env.nowElapsed(),
             nextSessionId = repo.peekNextSessionId()
         )
-        if (gateIfNeeded(ev)) return@submit
         process(ev)
     }
 
@@ -174,9 +236,123 @@ class SessionController(
         submit {
             process(
                 SessionEvent.Selected(
-                    pendingSessionId, unlimited, durationMs ?: 0L, SystemClock.elapsedRealtime()
+                    pendingSessionId, unlimited, durationMs ?: 0L, env.nowElapsed()
                 )
             )
+        }
+        return true
+    }
+
+    // ------------------------------------------------------------------
+    // 提醒
+    // ------------------------------------------------------------------
+
+    private fun processReminder(firedSessionId: Long, thresholdMs: Long) {
+        val cur = snapshot
+        if (cur.state != SessionState.TIMING || cur.sessionId != firedSessionId) {
+            diag.log(
+                "RMD",
+                "提醒到达但会话不匹配（事件=$firedSessionId/${thresholdMs}ms 当前=${cur.sessionId}/${cur.state}），忽略旧事件"
+            )
+            return
+        }
+        val now = env.nowElapsed()
+        if (now >= cur.deadlineElapsed) {
+            // 已到期：优先执行到期处理，不再发提前提醒
+            diag.log("RMD", "提醒到达时已到期（now=$now ≥ deadline=${cur.deadlineElapsed}），转到期处理")
+            process(SessionEvent.AlarmFired(firedSessionId, now))
+            return
+        }
+        val planned = ReminderPlanner.PlannedReminder(thresholdMs, cur.deadlineElapsed - thresholdMs)
+        return when (ReminderPlanner.classify(planned, now)) {
+            ReminderPlanner.Outcome.SCHEDULE_FUTURE -> {
+                // 闹钟异常提前：按计划时间重排，不投递
+                env.scheduleReminderAlarm(firedSessionId, thresholdMs, planned.triggerElapsed)
+                diag.log("RMD", "提醒异常提前（剩余 ${planned.triggerElapsed - now}ms），已重排")
+            }
+
+            ReminderPlanner.Outcome.SKIP_MISSED -> {
+                // 历史错过：只记录，不补发（消费标记一并落盘防重复）
+                repo.markReminderConsumed("$firedSessionId:$thresholdMs")
+                diag.log("RMD", "提醒已错过超过 ${ReminderPlanner.LATE_WINDOW_MS}ms 窗口，跳过不补发")
+            }
+
+            ReminderPlanner.Outcome.DELIVER_NOW -> {
+                // 消费标记在通知请求之前可靠保存；崩溃窗口为“标记已存、通知未发”，如实记录不夸大
+                if (!repo.markReminderConsumed("$firedSessionId:$thresholdMs")) {
+                    diag.log("RMD", "提醒重复投递被抑制（标记已存在）")
+                    return
+                }
+                if (!env.notificationsEnabled()) {
+                    diag.log("RMD", "提醒投递时通知已被系统禁用，本次提醒无法呈现")
+                    return
+                }
+                env.notifyReminder(firedSessionId, thresholdMs)
+                diag.log(
+                    "RMD",
+                    "提前提醒已投递 threshold=${thresholdMs}ms now=$now trigger=${planned.triggerElapsed} " +
+                        "（实际迟到 ${now - planned.triggerElapsed}ms）"
+                )
+            }
+        }
+    }
+
+    /** 会话计时确认/恢复后，按快照重新安排提醒任务 */
+    private fun armReminders(snap: SessionSnapshot, nowElapsed: Long, recovering: Boolean) {
+        if (!snap.isTiming) return
+        val duration = snap.deadlineElapsed - snap.startedElapsed
+        val planned = ReminderPlanner.plan(snap.sessionReminderThresholds, snap.deadlineElapsed, duration)
+        val skippedKeys = ArrayList<String>()
+        for (p in planned) {
+            val key = "${snap.sessionId}:${p.thresholdMs}"
+            if (key in repo.consumedReminders()) continue
+            when {
+                !recovering -> {
+                    val ok = env.scheduleReminderAlarm(snap.sessionId, p.thresholdMs, p.triggerElapsed)
+                    diag.log("RMD", "提醒已排定 threshold=${p.thresholdMs}ms trigger=${p.triggerElapsed} ok=$ok")
+                }
+
+                nowElapsed < p.triggerElapsed -> {
+                    val ok = env.scheduleReminderAlarm(snap.sessionId, p.thresholdMs, p.triggerElapsed)
+                    diag.log("RMD", "恢复：未来提醒重排 threshold=${p.thresholdMs}ms ok=$ok")
+                }
+
+                nowElapsed <= p.triggerElapsed + ReminderPlanner.LATE_WINDOW_MS -> {
+                    // 恢复时仍在投递迟到窗口内：照常提醒一次
+                    if (repo.markReminderConsumed(key)) {
+                        if (env.notificationsEnabled()) {
+                            env.notifyReminder(snap.sessionId, p.thresholdMs)
+                            diag.log("RMD", "恢复：提醒在迟到窗口内补投 threshold=${p.thresholdMs}ms")
+                        } else {
+                            diag.log("RMD", "恢复：窗口内提醒但通知被禁用，无法呈现")
+                        }
+                    }
+                }
+
+                else -> {
+                    skippedKeys.add(key)
+                }
+            }
+        }
+        if (skippedKeys.isNotEmpty()) {
+            repo.markRemindersSkipped(skippedKeys)
+            diag.log("RMD", "恢复：${skippedKeys.size} 个历史提醒已错过，跳过不补发")
+        }
+    }
+
+    /** 测试提醒：使用真实 channel 与构建路径，不改状态/截止/消费标记/锁屏 */
+    fun testReminder(): Boolean {
+        startIfNeeded()
+        if (!env.notificationsEnabled()) return false
+        val now = env.nowElapsed()
+        if (now - lastTestReminderAt < TEST_REMINDER_THROTTLE_MS) return false
+        lastTestReminderAt = now
+        submit {
+            env.notifyTestReminder()
+            diag.log("RMD", "测试提醒已发出（不占用真实提醒标记，不锁屏）")
+            env.postDelayed(KEY_TEST_REMINDER_CLEAR, TEST_REMINDER_AUTO_CLEAR_MS) {
+                env.cancelTestReminder()
+            }
         }
         return true
     }
@@ -198,7 +374,7 @@ class SessionController(
         if (enabled) {
             startMonitoringService()
         } else {
-            notifier.update(clearedSnapshot())
+            env.notifySession(clearedSnapshot(), repo.isShowCountdown())
             stopMonitoringService()
         }
         return true
@@ -206,7 +382,7 @@ class SessionController(
 
     fun quickMinutes(): List<Int> = repo.getQuickMinutes()
 
-    fun quickLabels(): List<String> = repo.getQuickMinutes().map { Format.minutesLabel(it) }
+    fun quickLabels(): List<String> = repo.getQuickMinutes().map { "${it} 分钟" }
 
     /** UI 读取监控开关（不做会话判断） */
     fun isMonitoringEnabledForUi(): Boolean = repo.isMonitoringEnabled()
@@ -218,7 +394,39 @@ class SessionController(
         return ok
     }
 
+    fun isShowCountdown(): Boolean = repo.isShowCountdown()
+
+    /** 只控制显示，立即生效：不改截止时间、不停服务、不取消闹钟 */
+    fun setShowCountdown(value: Boolean) {
+        repo.setShowCountdown(value)
+        diag.log("CFG", "通知栏倒计时显示 → $value（仅显示设置）")
+        submit { env.notifySession(snapshot, value) }
+    }
+
+    fun isRemindersEnabled(): Boolean = repo.isRemindersEnabled()
+
+    fun setRemindersEnabled(value: Boolean) {
+        repo.setRemindersEnabled(value)
+        diag.log("CFG", "提前提醒开关 → $value（下次会话生效）")
+    }
+
+    fun reminderThresholds(): List<Long> = repo.getReminderThresholds()
+
+    /** 保存时点（秒，规范化）；只影响之后的新会话 */
+    fun setReminderThresholds(values: List<Long>): Boolean {
+        val norm = ReminderPlanner.normalize(values)
+        val ok = repo.setReminderThresholds(norm)
+        if (ok) diag.log("CFG", "提前提醒时点已更新：$norm 秒（下次会话生效）")
+        return ok
+    }
+
     fun isDebugSecondsMode(): Boolean = repo.isDebugSecondsMode()
+
+    /** UI 读取系统通知总开关（用于测试提醒按钮的禁用提示） */
+    fun notificationsEnabledForUi(): Boolean {
+        startIfNeeded()
+        return env.notificationsEnabled()
+    }
 
     fun setDebugSecondsMode(value: Boolean) = repo.setDebugSecondsMode(value)
 
@@ -239,10 +447,70 @@ class SessionController(
     // 面板桥接（悬浮层 / 兜底 Activity 共用）
     // ------------------------------------------------------------------
 
-    internal fun panelBridge(): com.local.unlocksession.session.SessionPanelBridge = panelBridge
+    internal fun panelBridge(): SessionPanelBridge = panelBridge
 
     internal fun submitSelection(pendingSessionId: Long, unlimited: Boolean, durationMs: Long?) =
         select(pendingSessionId, unlimited, durationMs)
+
+    // ------------------------------------------------------------------
+    // R0：keyguard 过渡期复核
+    // ------------------------------------------------------------------
+
+    private fun startKeyguardRecheck() {
+        recheckGeneration++
+        val gen = recheckGeneration
+        var remaining = KG_RECHECK_MAX_TRIES
+        diag.log("RCK", "USER_PRESENT 到达但 keyguard 仍锁定（密码解锁过渡期？），开始有限复核 gen=$gen")
+        fun recheck() {
+            submit {
+                if (gen != recheckGeneration) return@submit
+                val locked = keyguardLockedFact()
+                if (!locked && env.isInteractive()) {
+                    diag.log("RCK", "复核通过 gen=$gen：keyguard 已消失，视为有效解锁")
+                    process(SessionEvent.UserPresent(false, repo.peekNextSessionId(), env.nowElapsed()))
+                } else {
+                    remaining--
+                    if (remaining <= 0) {
+                        diag.log("RCK", "复核放弃 gen=$gen：${KG_RECHECK_MAX_TRIES} 次内 keyguard 始终锁定")
+                    } else {
+                        env.postDelayed(KEY_KG_RECHECK, KG_RECHECK_INTERVAL_MS) { recheck() }
+                    }
+                }
+            }
+        }
+        env.postDelayed(KEY_KG_RECHECK, KG_RECHECK_INTERVAL_MS) { recheck() }
+    }
+
+    private fun keyguardLockedFact(): Boolean = env.isKeyguardLocked() || env.isDeviceLocked()
+
+    // ------------------------------------------------------------------
+    // R0 补充：解锁一致性心跳
+    // ------------------------------------------------------------------
+
+    /**
+     * 亮屏期间每 2 秒核对"可交互 + keyguard 未锁 + 无会话"。
+     * 仅在亮屏时运行、熄屏即停、发现不一致（补出待选择）即停；
+     * 不写磁盘、不持有唤醒锁，不替代 USER_PRESENT 主路径，
+     * 专堵"宽限期无凭据放行"等不产生任何广播的解锁路径。
+     */
+    private fun startUnlockHeartbeat() {
+        env.postDelayed(KEY_HEARTBEAT, HEARTBEAT_MS) { submit { heartbeatOnce() } }
+    }
+
+    private fun heartbeatOnce() {
+        if (!env.isInteractive()) {
+            diag.log("HB", "心跳停止：已熄屏")
+            return
+        }
+        if (snapshot.state != SessionState.NO_SESSION) return // 会话存在：无需再查
+        if (!repo.isMonitoringEnabled() || !env.isAdminActive() || !env.canDrawOverlays()) return
+        if (!env.isKeyguardLocked() && !env.isDeviceLocked()) {
+            diag.log("HB", "心跳发现已解锁且无会话：补上待选择（宽限期放行或广播丢失）")
+            process(SessionEvent.ScreenOn(interactive = true, keyguardLocked = false, nextSessionId = repo.peekNextSessionId()))
+            return
+        }
+        env.postDelayed(KEY_HEARTBEAT, HEARTBEAT_MS) { submit { heartbeatOnce() } }
+    }
 
     // ------------------------------------------------------------------
     // 内部：串行处理
@@ -265,53 +533,80 @@ class SessionController(
         if (!changed) {
             diag.log(
                 "EVT",
-                "${label(ev)} → 无变化 state=${from.state}(${from.sessionId})"
+                (label(ev) + " → 无变化 state=${from.state}(${from.sessionId})")
                     .let { if (t.note != null) "$it note=${t.note}" else it }
             )
             return
         }
-        snapshot = t.snapshot
-        if (t.snapshot.sessionId != from.sessionId) {
-            if (from.sessionId != 0L) previousSessionId = from.sessionId
-            if (t.snapshot.sessionId != 0L) repo.commitSessionId(t.snapshot.sessionId)
+        var newSnap = t.snapshot
+        // 会话提醒配置快照：确认计时那一刻的全局设置，此后本次会话不受设置修改影响
+        if (newSnap.state == SessionState.TIMING && from.state == SessionState.PENDING_SELECTION) {
+            val cfgEnabled = repo.isRemindersEnabled()
+            val cfgThresholds = if (cfgEnabled) repo.getReminderThresholds() else emptyList()
+            newSnap = newSnap.copy(
+                sessionRemindersEnabled = cfgEnabled,
+                sessionReminderThresholds = ReminderPlanner.normalize(cfgThresholds)
+            )
         }
-        if (t.snapshot.state != SessionState.LOCK_REQUESTED && t.snapshot.state != SessionState.LOCK_FAILED) {
-            lockRetries = 0
+        snapshot = newSnap
+        if (newSnap.sessionId != from.sessionId) {
+            if (from.sessionId != 0L) previousSessionId = from.sessionId
+            if (newSnap.sessionId != 0L) repo.commitSessionId(newSnap.sessionId)
+        }
+        // R1：会话结束/替换时取消锁屏重试与看门狗
+        if (newSnap.sessionId != from.sessionId ||
+            (from.state in LOCK_STATES && newSnap.state !in LOCK_STATES)
+        ) {
+            cancelLockTasks(from.sessionId)
         }
         diag.log(
             "EVT",
-            "${label(ev)}: ${from.state}(${from.sessionId}) → ${t.snapshot.state}(${t.snapshot.sessionId})"
+            (label(ev) + ": ${from.state}(${from.sessionId}) → ${newSnap.state}(${newSnap.sessionId})")
                 .let { if (t.note != null) "$it note=${t.note}" else it }
         )
-        execute(t.actions, t.snapshot)
+        // 会话结束：清理该会话的提醒任务与通知（用旧快照的配置）
+        if (from.isActive && !newSnap.isActive) {
+            env.cancelReminderAlarms(from.sessionReminderThresholds)
+            env.cancelReminderNotifications(from.sessionReminderThresholds)
+            repo.clearConsumedReminders(from.sessionId)
+        }
+        execute(t.actions, newSnap, from)
         publish()
         scheduleNotificationTick()
-        maybeScheduleLockRetry(t.snapshot.state)
+        maybeScheduleLockRetry(newSnap)
+        // 计时确认后安排提醒（使用确认时刻的快照配置）
+        if (newSnap.isTiming && from.state == SessionState.PENDING_SELECTION) {
+            armReminders(newSnap, env.nowElapsed(), recovering = false)
+        }
+        // 恢复续期后按当前时刻重排/跳过提醒（错过的不补发）
+        if (newSnap.isTiming && ev is SessionEvent.Recover) {
+            armReminders(newSnap, env.nowElapsed(), recovering = true)
+        }
     }
 
-    private fun execute(actions: List<SessionAction>, snap: SessionSnapshot) {
+    private fun execute(actions: List<SessionAction>, snap: SessionSnapshot, from: SessionSnapshot) {
         for (a in actions) {
             try {
                 when (a) {
                     SessionAction.Persist -> {
-                        repo.setBootAtSave(Diagnostics.bootCount(appContext))
+                        repo.setBootAtSave(env.bootCount())
                         repo.saveSnapshot(snap)
                     }
 
                     SessionAction.ShowSelectionOverlay -> showSelectionOverlay(snap)
-                    SessionAction.HideSelectionOverlay -> mainHandler.post { SelectionOverlay.hide() }
+                    SessionAction.HideSelectionOverlay -> env.hideSelectionOverlay()
 
-                    is SessionAction.ScheduleAlarm -> scheduleAlarm(a.sessionId, a.deadlineElapsed)
-                    SessionAction.CancelAlarm -> cancelAlarm()
+                    is SessionAction.ScheduleAlarm -> scheduleDeadlineAlarm(a.sessionId, a.deadlineElapsed)
+                    SessionAction.CancelAlarm -> env.cancelDeadlineAlarm()
 
-                    SessionAction.RequestLockNow -> performLockNow()
-                    SessionAction.RequestLockOnScreenOff -> performLockOnScreenOff()
+                    SessionAction.RequestLockNow -> performLockNow(snap.sessionId, SessionState.LOCK_REQUESTED)
+                    SessionAction.RequestLockOnScreenOff -> env.enforceLockOnScreenOff()
 
-                    SessionAction.UpdateNotification -> notifier.update(snap)
-                    SessionAction.ShowNotReadyNotification -> notifier.showNotReady("功能未就绪")
+                    SessionAction.UpdateNotification -> env.notifySession(snap, repo.isShowCountdown())
+                    SessionAction.ShowNotReadyNotification -> env.notifyNotReady("功能未就绪")
 
-                    is SessionAction.ScheduleLockWatchdog -> scheduleWatchdog(a.delayMs)
-                    SessionAction.CancelLockWatchdog -> cancelWatchdog()
+                    is SessionAction.ScheduleLockWatchdog -> scheduleWatchdog(a.delayMs, snap.sessionId)
+                    SessionAction.CancelLockWatchdog -> env.cancelDelayed(KEY_WATCHDOG)
                 }
             } catch (e: Exception) {
                 diag.log("ERR", "执行动作 $a 异常: ${e.javaClass.simpleName}: ${e.message}")
@@ -324,191 +619,208 @@ class SessionController(
         if (snapshot.state != SessionState.NO_SESSION) return false
         val missing = capabilityGate()
         if (missing == null) {
-            notifier.clearNotReady()
+            env.cancelNotReady()
             return false
         }
         diag.log("GATE", "事件 ${label(ev)} 被拒：$missing")
-        notifier.showNotReady(missing)
+        env.notifyNotReady(missing)
         return true
     }
 
     private fun capabilityGate(): String? {
         if (!repo.isMonitoringEnabled()) return "监控已关闭"
-        if (!LockController.isAdminActive(appContext)) return "设备管理员未启用"
-        if (!Settings.canDrawOverlays(appContext)) return "悬浮窗权限未授予"
+        if (!env.isAdminActive()) return "设备管理员未启用"
+        if (!env.canDrawOverlays()) return "悬浮窗权限未授予"
         return null
     }
 
     private fun showSelectionOverlay(snap: SessionSnapshot) {
-        if (!Settings.canDrawOverlays(appContext)) {
+        if (!env.canDrawOverlays()) {
             diag.log("OVF", "无法显示选择层：悬浮窗权限缺失")
-            notifier.showNotReady("悬浮窗权限未授予")
+            env.notifyNotReady("悬浮窗权限未授予")
             return
         }
-        mainHandler.post {
+        env.postUi {
             try {
-                SelectionOverlay.show(
-                    appContext,
-                    snap.sessionId,
-                    quickLabels(),
-                    repo.isDebugSecondsMode(),
-                    panelBridge
-                )
-                diag.log("OVF", "已请求显示选择层 sessionId=${snap.sessionId}")
+                env.showSelectionOverlay(snap.copy())
             } catch (e: Exception) {
                 diag.log("OVF", "显示选择层异常: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
     }
 
-    private fun scheduleAlarm(sessionId: Long, deadlineElapsed: Long) {
-        val am = appContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        try {
-            am.setExact(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                deadlineElapsed,
-                alarmPendingIntent(sessionId)
-            )
-            diag.log(
-                "ALARM",
-                "已设定到期闹钟 sessionId=$sessionId deadline=$deadlineElapsed " +
-                    "剩余=${deadlineElapsed - SystemClock.elapsedRealtime()}ms"
-            )
+    private fun scheduleDeadlineAlarm(sessionId: Long, deadlineElapsed: Long) {
+        val ok = try {
+            env.scheduleDeadlineAlarm(sessionId, deadlineElapsed)
         } catch (e: Exception) {
-            diag.log("ALARM", "设定闹钟失败: ${e.javaClass.simpleName}: ${e.message}")
+            diag.log("ALARM", "设定闹钟异常: ${e.javaClass.simpleName}: ${e.message}")
+            false
         }
-    }
-
-    private fun cancelAlarm() {
-        val am = appContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        try {
-            am.cancel(alarmPendingIntent(0L))
-            diag.log("ALARM", "已取消到期闹钟")
-        } catch (e: Exception) {
-            diag.log("ALARM", "取消闹钟异常: ${e.javaClass.simpleName}: ${e.message}")
-        }
-    }
-
-    private fun alarmPendingIntent(sessionId: Long): PendingIntent {
-        val intent = Intent(appContext, SessionAlarmReceiver::class.java)
-            .setAction(SessionAlarmReceiver.ACTION_SESSION_ALARM)
-            .putExtra(SessionAlarmReceiver.EXTRA_SESSION_ID, sessionId)
-        return PendingIntent.getBroadcast(
-            appContext,
-            REQUEST_CODE_ALARM,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        diag.log(
+            "ALARM",
+            "到期闹钟排定 sessionId=$sessionId deadline=$deadlineElapsed " +
+                "剩余=${deadlineElapsed - env.nowElapsed()}ms ok=$ok"
         )
+        // R7：排定结果回传状态机；失败时快照如实标记，进程内兜底检查接管
+        submit { process(SessionEvent.AlarmScheduleOutcome(sessionId, ok)) }
     }
 
-    /** 到期锁屏：先进入 LOCK_REQUESTED 再调用 lockNow()，结果回传状态机 */
-    private fun performLockNow() {
-        val (ok, err) = LockController.requestLock(appContext, diag)
+    /** 到期锁屏：先校验会话，再调用 lockNow()，结果回传状态机（R1） */
+    private fun performLockNow(sessionId: Long, expectState: SessionState) {
+        val cur = snapshot
+        if (cur.state != expectState || cur.sessionId != sessionId) {
+            diag.log(
+                "LOCK",
+                "锁屏请求取消执行：会话不匹配（请求=$sessionId/$expectState 当前=${cur.sessionId}/${cur.state}）"
+            )
+            return
+        }
+        val (ok, err) = env.lockNow()
         submit {
-            process(SessionEvent.LockOutcome(ok, err, SystemClock.elapsedRealtime()))
+            process(SessionEvent.LockOutcome(sessionId, ok, err, env.nowElapsed()))
         }
     }
 
-    /** 提前熄屏结束会话时加强 keyguard，消除系统解锁宽限期（仅在系统有安全凭据时有效） */
-    private fun performLockOnScreenOff() {
-        if (!LockController.isAdminActive(appContext)) {
-            diag.log("LOCK", "熄屏加强锁定跳过：管理员未启用")
-            return
-        }
-        if (!LockController.isKeyguardSecure(appContext)) {
-            diag.log("LOCK", "熄屏加强锁定跳过：系统未设置安全锁屏凭据")
-            return
-        }
-        try {
-            val dpm = appContext.getSystemService(Context.DEVICE_POLICY_SERVICE)
-                as android.app.admin.DevicePolicyManager
-            dpm.lockNow()
-            diag.log("LOCK", "熄屏后已调用 lockNow() 加强 keyguard（防宽限期）")
-        } catch (e: Exception) {
-            diag.log("LOCK", "熄屏加强锁定异常: ${e.javaClass.simpleName}: ${e.message}")
+    /** 提前熄屏结束会话时加强 keyguard（env 内部判断管理员+安全凭据） */
+    private fun scheduleWatchdog(delayMs: Long, sessionId: Long) {
+        env.cancelDelayed(KEY_WATCHDOG)
+        env.postDelayed(KEY_WATCHDOG, delayMs) {
+            submit {
+                process(SessionEvent.LockWatchdog(sessionId, env.nowElapsed()))
+            }
         }
     }
 
     /** 锁屏失败后自动重试一次（3 秒后），仍失败则保持失败状态并记录 */
-    private fun maybeScheduleLockRetry(state: SessionState) {
-        if (state != SessionState.LOCK_FAILED || lockRetries >= 1) return
+    private fun maybeScheduleLockRetry(snap: SessionSnapshot) {
+        if (snap.state != SessionState.LOCK_FAILED || lockRetries >= 1) return
         lockRetries = 1
-        mainHandler.postDelayed({
+        val sessionId = snap.sessionId
+        env.postDelayed(KEY_LOCK_RETRY, LOCK_RETRY_MS) {
             submit {
-                diag.log("LOCK", "锁屏失败重试（第 1 次）")
-                performLockNow()
-            }
-        }, LOCK_RETRY_MS)
-    }
-
-    private fun scheduleWatchdog(delayMs: Long) {
-        cancelWatchdog()
-        val token = Runnable { submit { process(SessionEvent.LockWatchdog(SystemClock.elapsedRealtime())) } }
-        watchdogToken = token
-        mainHandler.postDelayed(token, delayMs)
-    }
-
-    private fun cancelWatchdog() {
-        watchdogToken?.let { mainHandler.removeCallbacks(it) }
-        watchdogToken = null
-    }
-
-    /** 计时中的通知每秒刷新剩余时间（仅 UI 通知，不写磁盘） */
-    private fun scheduleNotificationTick() {
-        if (snapshot.isTiming) {
-            if (tickToken == null) {
-                val token = Runnable {
-                    tickToken = null
-                    if (snapshot.isTiming) {
-                        notifier.update(snapshot)
-                        scheduleNotificationTick()
-                    }
+                val cur = snapshot
+                if (cur.state != SessionState.LOCK_FAILED || cur.sessionId != sessionId) {
+                    diag.log("LOCK", "锁屏重试取消执行：会话已变化（原=$sessionId 当前=${cur.sessionId}/${cur.state}）")
+                    return@submit
                 }
-                tickToken = token
-                mainHandler.postDelayed(token, TICK_MS)
+                diag.log("LOCK", "锁屏失败重试（第 1 次）")
+                performLockNow(sessionId, SessionState.LOCK_FAILED)
             }
-        } else {
-            tickToken?.let { mainHandler.removeCallbacks(it) }
-            tickToken = null
         }
+    }
+
+    private fun cancelLockTasks(sessionId: Long) {
+        env.cancelDelayed(KEY_WATCHDOG)
+        env.cancelDelayed(KEY_LOCK_RETRY)
+        diag.log("LOCK", "已取消会话 $sessionId 的看门狗与重试任务")
+    }
+
+    /** 计时中的通知刷新 + 进程内到期兜底检查（R7；兜底经同一状态机、原截止时间与会话标识） */
+    private fun scheduleNotificationTick() {
+        if (!snapshot.isTiming) {
+            env.cancelDelayed(KEY_TICK)
+            return
+        }
+        if (env.hasDelayed(KEY_TICK)) return
+        env.postDelayed(KEY_TICK, TICK_MS) { submit { tickOnce() } }
+    }
+
+    private fun tickOnce() {
+        val cur = snapshot
+        if (!cur.isTiming) return
+        val now = env.nowElapsed()
+        // 低频轨迹：验证 tick 链连续性（每 10s 一行，不做每秒刷屏）
+        if (now - lastTickTrace >= 10_000L) {
+            lastTickTrace = now
+            diag.log("TICK-TRACE", "tick 运行中 now=$now deadline=${cur.deadlineElapsed}")
+        }
+        if (now >= cur.deadlineElapsed) {
+            // 兜底到期：与系统闹钟走同一状态机路径，幂等
+            diag.log("TICK", "进程内兜底检查触发到期（now=$now ≥ deadline=${cur.deadlineElapsed}）")
+            process(SessionEvent.AlarmFired(cur.sessionId, now))
+            return
+        }
+        deliverDueRemindersViaTick(cur, now)
+        if (repo.isShowCountdown()) env.notifySession(cur, true)
+        env.postDelayed(KEY_TICK, TICK_MS) { submit { tickOnce() } }
+    }
+
+    /**
+     * 提醒兜底：真机（ColorOS）实测会把同应用的多个精确闹钟合并推迟（60s 提醒被推到
+     * 30s 时刻才触发，超窗被正确跳过）。tick 每秒运行，发现"已到点且未消费"的提醒
+     * 立即投递（消费标记先行），把提醒准时性从闹钟路径的 ±OEM 推迟补到 ±1s。
+     * 到期锁屏不依赖本兜底（主路径仍是到期闹钟）。
+     */
+    private fun deliverDueRemindersViaTick(snap: SessionSnapshot, now: Long) {
+        if (snap.sessionReminderThresholds.isEmpty()) return
+        val duration = snap.deadlineElapsed - snap.startedElapsed
+        for (t in snap.sessionReminderThresholds) {
+            val trigger = snap.deadlineElapsed - t * 1000L
+            if (t * 1000L !in 1 until duration) continue
+            if (now < trigger) continue
+            val key = "${snap.sessionId}:${t * 1000L}"
+            if (key in repo.consumedReminders()) continue
+            if (!repo.markReminderConsumed(key)) continue
+            if (env.notificationsEnabled()) {
+                env.notifyReminder(snap.sessionId, t * 1000L)
+                diag.log("RMD", "tick 兜底投递提醒 threshold=${t * 1000L}ms（闹钟迟到补偿）now=$now trigger=$trigger")
+            } else {
+                diag.log("RMD", "tick 兜底发现到点提醒但通知被禁用，无法呈现 threshold=${t * 1000L}ms")
+            }
+        }
+    }
+
+    /** 冷启动核对：开机归属 + 真实锁屏状态（R2）。返回 false 表示事件应丢弃 */
+    private fun verifyColdStart(source: String): Boolean {
+        val sameBoot = computeSameBoot()
+        val interactive = env.isInteractive()
+        val keyguardLocked = keyguardLockedFact()
+        diag.log(
+            "COLD",
+            "$source 冷启动核对: sameBoot=$sameBoot interactive=$interactive keyguardLocked=$keyguardLocked " +
+                "persisted=(${snapshot.state}/${snapshot.sessionId})"
+        )
+        if (!sameBoot) {
+            process(
+                SessionEvent.Recover(
+                    interactive, keyguardLocked, sameBoot = false, canCreateSession = capabilityGate() == null,
+                    nowElapsed = env.nowElapsed(), nextSessionId = repo.peekNextSessionId()
+                )
+            )
+            return false
+        }
+        if (!interactive || keyguardLocked) {
+            // 已锁屏/熄屏：旧快照不可信（漏收熄屏事件），先恢复核对，会话按事实结束
+            process(
+                SessionEvent.Recover(
+                    interactive, keyguardLocked, sameBoot = true, canCreateSession = capabilityGate() == null,
+                    nowElapsed = env.nowElapsed(), nextSessionId = repo.peekNextSessionId()
+                )
+            )
+            return false
+        }
+        return true
     }
 
     private fun publish() {
         val snap = snapshot
-        mainHandler.post {
+        env.postUi {
             for (l in uiListeners) l(snap)
         }
     }
 
     // ------------------------------------------------------------------
-    // 设备事实
+    // 设备事实（委托 env）
     // ------------------------------------------------------------------
-
-    private fun isInteractive(): Boolean {
-        val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
-        return pm.isInteractive
-    }
-
-    /** 通话中的接近传感器黑屏不是会话结束信号（无需 READ_PHONE_STATE 的尽力判断） */
-    private fun isInCall(): Boolean {
-        val am = appContext.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
-            ?: return false
-        return try {
-            am.mode == android.media.AudioManager.MODE_IN_CALL ||
-                am.mode == android.media.AudioManager.MODE_IN_COMMUNICATION
-        } catch (e: Exception) {
-            false
-        }
-    }
 
     /** 持久化快照是否属于本次开机：boot_count 为主，单调时钟兜底 */
     private fun computeSameBoot(): Boolean {
         val savedBoot = repo.savedBootCount()
-        val currentBoot = Diagnostics.bootCount(appContext)
+        val currentBoot = env.bootCount()
         return if (savedBoot != -1 && currentBoot != -1) {
             savedBoot == currentBoot
         } else {
-            repo.savedElapsed() <= SystemClock.elapsedRealtime()
+            repo.savedElapsed() <= env.nowElapsed()
         }
     }
 
@@ -517,41 +829,51 @@ class SessionController(
     // ------------------------------------------------------------------
 
     fun startMonitoringService() {
-        try {
-            val intent = Intent(appContext, UnlockMonitorService::class.java)
-                .putExtra(UnlockMonitorService.EXTRA_REASON, "controller 启动监控")
-            appContext.startForegroundService(intent)
-        } catch (e: Exception) {
-            diag.log("SVC", "启动前台服务失败: ${e.javaClass.simpleName}: ${e.message}")
-        }
+        env.startMonitoringService("controller 启动监控")
     }
 
     private fun stopMonitoringService() {
-        try {
-            appContext.stopService(Intent(appContext, UnlockMonitorService::class.java))
-        } catch (e: Exception) {
-            diag.log("SVC", "停止前台服务失败: ${e.message}")
-        }
+        env.stopMonitoringService()
     }
 
     private fun clearedSnapshot() = snapshot.copy(state = SessionState.NO_SESSION)
 
     private fun label(ev: SessionEvent): String = when (ev) {
         is SessionEvent.ScreenOn -> "ScreenOn(interactive=${ev.interactive},kg=${ev.keyguardLocked})"
-        is SessionEvent.ScreenOff -> "ScreenOff(secure=${ev.keyguardSecure},inCall=${ev.inCall})"
-        is SessionEvent.UserPresent -> "UserPresent(kg=${ev.keyguardLocked})"
+        is SessionEvent.ScreenOff ->
+            "ScreenOff(kg=${ev.keyguardLocked},devLocked=${ev.isDeviceLocked},secure=${ev.keyguardSecure},inCall=${ev.inCall})"
+        is SessionEvent.UserPresent -> "UserPresent(kg=${ev.keyguardLocked},now=${ev.nowElapsed})"
         is SessionEvent.AlarmFired -> "AlarmFired(id=${ev.firedSessionId},now=${ev.nowElapsed})"
+        is SessionEvent.AlarmScheduleOutcome -> "AlarmScheduleOutcome(id=${ev.sessionId},ok=${ev.ok})"
         is SessionEvent.Selected ->
             "Selected(id=${ev.pendingSessionId},${if (ev.unlimited) "不限" else "${ev.durationMs}ms"})"
-        is SessionEvent.LockOutcome -> "LockOutcome(ok=${ev.success},err=${ev.error})"
-        is SessionEvent.LockWatchdog -> "LockWatchdog(now=${ev.nowElapsed})"
+        is SessionEvent.LockOutcome -> "LockOutcome(id=${ev.sessionId},ok=${ev.success},err=${ev.error})"
+        is SessionEvent.LockWatchdog -> "LockWatchdog(id=${ev.sessionId},now=${ev.nowElapsed})"
         is SessionEvent.Recover ->
-            "Recover(interactive=${ev.interactive},kg=${ev.keyguardLocked},sameBoot=${ev.sameBoot})"
+            "Recover(interactive=${ev.interactive},kg=${ev.keyguardLocked},sameBoot=${ev.sameBoot},canCreate=${ev.canCreateSession})"
     }
 
     companion object {
-        private const val REQUEST_CODE_ALARM = 1001
+        private fun defaultExecutor(): ExecutorService =
+            Executors.newSingleThreadExecutor { r ->
+                Thread(r, "session-controller").apply { isDaemon = false }
+            }
+
+        private const val KEY_TICK = "tick"
+        private const val KEY_WATCHDOG = "watchdog"
+        private const val KEY_LOCK_RETRY = "lock-retry"
+        private const val KEY_KG_RECHECK = "kg-recheck"
+        private const val KEY_HEARTBEAT = "unlock-heartbeat"
+        private const val KEY_TEST_REMINDER_CLEAR = "test-reminder-clear"
+
         private const val TICK_MS = 1000L
         private const val LOCK_RETRY_MS = 3000L
+        private const val KG_RECHECK_INTERVAL_MS = 300L
+        private const val KG_RECHECK_MAX_TRIES = 6
+        private const val HEARTBEAT_MS = 2000L
+        private const val TEST_REMINDER_THROTTLE_MS = 2000L
+        private const val TEST_REMINDER_AUTO_CLEAR_MS = 10_000L
+
+        private val LOCK_STATES = setOf(SessionState.LOCK_REQUESTED, SessionState.LOCK_FAILED)
     }
 }
