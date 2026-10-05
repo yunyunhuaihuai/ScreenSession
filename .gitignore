@@ -1,0 +1,14 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# 日志与临时产物（诊断取证归档到 ../ScreenSession_Data）
+captures/
+*.log
+.DS_Store
