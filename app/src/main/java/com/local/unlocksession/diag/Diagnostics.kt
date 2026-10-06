@@ -85,7 +85,7 @@ class Diagnostics private constructor(private val logDir: File) : com.local.unlo
         private const val KEEP_BYTES = 128 * 1024
 
         /** 版本串（避免诊断类依赖 BuildConfig 生成时序） */
-        const val VERSION_NAME = "0.2.0"
+        const val VERSION_NAME = "0.3.0"
 
         /** 当前设备的 boot 计数，恢复检查用它区分“重启”与“同次开机进程恢复” */
         fun bootCount(context: Context): Int = try {

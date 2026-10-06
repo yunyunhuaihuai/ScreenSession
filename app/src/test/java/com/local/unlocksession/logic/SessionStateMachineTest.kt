@@ -254,7 +254,7 @@ class SessionStateMachineTest {
     }
 
     // ------------------------------------------------------------------
-    // R4：同解锁周期重复 USER_PRESENT
+    // R4：活动会话中的 USER_PRESENT 一律不重置（不按会话年龄判断）
     // ------------------------------------------------------------------
 
     @Test
@@ -267,12 +267,24 @@ class SessionStateMachineTest {
     }
 
     @Test
-    fun `R4_距会话开始较远的USER_PRESENT判定漏屏自愈重新选择`() {
-        val cur = timing(now = 100_000L, duration = 10 * 60_000L)
+    fun `R4_距会话开始较远的USER_PRESENT仍保持会话与截止时间`() {
+        // "事件来得晚"不构成真实锁屏的证据：真实锁屏周期由 SCREEN_OFF/SCREEN_ON
+        // 先行结束会话；会话仍活动说明从未观察到锁屏周期，绝不借迟到事件重新选择加时
+        val cur = timing(now = 100_000L, duration = 10 * 60_000L) // deadline=700_000
         val t = reduce(cur, SessionEvent.UserPresent(false, 11, nowElapsed = 100_000 + 60_000))
-        assertEquals(SessionState.PENDING_SELECTION, t.snapshot.state)
-        assertEquals(11L, t.snapshot.sessionId)
-        assertTrue(SessionAction.CancelAlarm in t.actions)
+        assertEquals(SessionState.TIMING, t.snapshot.state)
+        assertEquals(7L, t.snapshot.sessionId)
+        assertEquals(700_000L, t.snapshot.deadlineElapsed)
+        assertTrue(SessionAction.CancelAlarm !in t.actions)
+        assertTrue(SessionAction.ShowSelectionOverlay !in t.actions)
+    }
+
+    @Test
+    fun `R4_不限会话中的重复USER_PRESENT同样不重置`() {
+        val unlim = reduce(pending(), SessionEvent.Selected(7, true, 0, 1000)).snapshot
+        val t = reduce(unlim, SessionEvent.UserPresent(false, 12, nowElapsed = 61_000))
+        assertEquals(SessionState.UNLIMITED, t.snapshot.state)
+        assertEquals(7L, t.snapshot.sessionId)
     }
 
     // ------------------------------------------------------------------

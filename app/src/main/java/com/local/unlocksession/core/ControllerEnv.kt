@@ -52,6 +52,9 @@ interface ControllerEnv {
     fun startMonitoringService(reason: String)
     fun stopMonitoringService()
 
+    /** 监控前台服务当前是否挂载在本进程（用于恢复协调与诊断，幂等恢复的判据） */
+    fun isServiceAttached(): Boolean
+
     // ---- UI 线程 ----
     fun postUi(block: () -> Unit)
 

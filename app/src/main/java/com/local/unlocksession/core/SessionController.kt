@@ -1,5 +1,6 @@
 package com.local.unlocksession.core
 
+import com.local.unlocksession.data.ReminderMark
 import com.local.unlocksession.data.SessionStore
 import com.local.unlocksession.session.SessionPanelBridge
 import com.local.unlocksession.logic.ReminderPlanner
@@ -58,6 +59,23 @@ class SessionController internal constructor(
     /** 测试提醒节流 */
     private var lastTestReminderAt = 0L
 
+    // ---- 诊断健康信息（LogActivity 后台健康页读取；均为本进程可核实的事实） ----
+
+    /** 最近一次恢复检查的原因 */
+    @Volatile
+    var lastRecoverReason: String? = null
+        private set
+
+    /** 最近一次监控服务启动原因 */
+    @Volatile
+    var lastServiceStartReason: String? = null
+        private set
+
+    /** 最近一次有效解锁检测（含心跳发现），人类可读时间 + 来源 */
+    @Volatile
+    var lastUnlockDetected: String = "（本次开机尚无记录）"
+        private set
+
     private val uiListeners = CopyOnWriteArrayList<(SessionSnapshot) -> Unit>()
 
     // ------------------------------------------------------------------
@@ -75,6 +93,9 @@ class SessionController internal constructor(
         startIfNeeded()
         env.attachForegroundService(service)
         env.notifySession(snapshot, repo.isShowCountdown())
+        // 服务挂载即协调后续监控任务（幂等）：亮屏且无会话时确保解锁心跳在跑，
+        // 覆盖"服务在屏幕已亮、密码锁仍在、NO_SESSION 时被恢复"的场景
+        coordinateUnlockHeartbeat("服务挂载")
     }
 
     fun detachService(service: android.app.Service) {
@@ -138,6 +159,7 @@ class SessionController internal constructor(
             startKeyguardRecheck()
             return@submit
         }
+        noteUnlockDetected("USER_PRESENT")
         process(ev)
     }
 
@@ -159,10 +181,17 @@ class SessionController internal constructor(
                 } catch (e: Exception) {
                     diag.log("ERR", "到期事件处理异常: ${e.javaClass.simpleName}: ${e.message}")
                 } finally {
+                    // 广播拉起进程后恢复监控（幂等）。放在收尾阶段：到期锁屏由本广播
+                    // 的受保护处理完成，绝不依赖服务启动成功；finish 前仍在闹钟广播
+                    // 的临时允许名单窗口内，是恢复前台服务的合法时机。
                     try {
-                        onFinished()
-                    } catch (e: Exception) {
-                        diag.log("ERR", "广播 finish 异常: ${e.message}")
+                        ensureMonitoringServiceForWake("到期闹钟")
+                    } finally {
+                        try {
+                            onFinished()
+                        } catch (e: Exception) {
+                            diag.log("ERR", "广播 finish 异常: ${e.message}")
+                        }
                     }
                 }
             }
@@ -188,9 +217,13 @@ class SessionController internal constructor(
                     diag.log("ERR", "提醒处理异常: ${e.javaClass.simpleName}: ${e.message}")
                 } finally {
                     try {
-                        onFinished()
-                    } catch (e: Exception) {
-                        diag.log("ERR", "广播 finish 异常: ${e.message}")
+                        ensureMonitoringServiceForWake("提前提醒")
+                    } finally {
+                        try {
+                            onFinished()
+                        } catch (e: Exception) {
+                            diag.log("ERR", "广播 finish 异常: ${e.message}")
+                        }
                     }
                 }
             }
@@ -204,11 +237,30 @@ class SessionController internal constructor(
     }
 
     /**
+     * 系统唤醒入口（提醒/到期闹钟广播）把进程拉起后的幂等恢复：
+     * 监控开启且服务未挂载时重新拉起前台服务（闹钟广播使应用进入临时允许名单，
+     * Android 10 允许在该窗口启动前台服务；服务已在跑时重复调用只会多一次
+     * onStartCommand，无副作用）。用户主动关闭监控后不得复活。
+     * 启动失败只如实记录——本次事件的处理与到期锁屏不依赖服务启动成功。
+     */
+    private fun ensureMonitoringServiceForWake(source: String) {
+        try {
+            if (!repo.isMonitoringEnabled()) return
+            if (env.isServiceAttached()) return
+            diag.log("SVC", "$source 拉起进程且服务未挂载，恢复监控服务")
+            env.startMonitoringService("$source 拉起进程恢复监控")
+        } catch (e: Exception) {
+            diag.log("SVC", "恢复监控服务失败（不影响本次事件处理）: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /**
      * 恢复检查：开机、服务重启、进程恢复、应用更新后调用。
      * 服务可能在首次解锁广播之后才启动，必须主动核对当前状态补上选择界面。
      */
     fun recover(reason: String) = submit {
         startIfNeeded()
+        lastRecoverReason = reason
         val interactive = env.isInteractive()
         val keyguardLocked = keyguardLockedFact()
         val sameBoot = computeSameBoot()
@@ -227,6 +279,10 @@ class SessionController internal constructor(
             nextSessionId = repo.peekNextSessionId()
         )
         process(ev)
+        // 恢复后协调后续监控任务（幂等）：亮屏且仍无会话（如屏幕已亮、密码锁仍在的
+        // 恢复场景）时确保解锁心跳在跑，覆盖本机"解锁不发送 USER_PRESENT"的路径；
+        // 已有会话/熄屏/能力缺失时该调用不做任何事，不会形成重复循环。
+        coordinateUnlockHeartbeat("恢复($reason)")
     }
 
     /** 用户做出选择。输入非法返回 false（不产生事件）；选择从确认时刻开始计时 */
@@ -278,21 +334,30 @@ class SessionController internal constructor(
             }
 
             ReminderPlanner.Outcome.DELIVER_NOW -> {
-                // 消费标记在通知请求之前可靠保存；崩溃窗口为“标记已存、通知未发”，如实记录不夸大
-                if (!repo.markReminderConsumed("$firedSessionId:$thresholdMs")) {
-                    diag.log("RMD", "提醒重复投递被抑制（标记已存在）")
-                    return
+                // 消费标记在通知请求之前同步落盘（commit）。通知请求与磁盘事务无法组成
+                // 原子操作：崩溃窗口为"标记已存、通知未发"——本产品优先避免重复历史
+                // 提醒，不能承诺用户一定看到了每条提醒。
+                when (repo.markReminderConsumed("$firedSessionId:$thresholdMs")) {
+                    ReminderMark.NEW -> {
+                        if (!env.notificationsEnabled()) {
+                            diag.log("RMD", "提醒投递时通知已被系统禁用，本次提醒无法呈现")
+                            return
+                        }
+                        env.notifyReminder(firedSessionId, thresholdMs)
+                        diag.log(
+                            "RMD",
+                            "提前提醒已投递 threshold=${thresholdMs}ms now=$now trigger=${planned.triggerElapsed} " +
+                                "（实际迟到 ${now - planned.triggerElapsed}ms）"
+                        )
+                    }
+
+                    ReminderMark.DUPLICATE ->
+                        diag.log("RMD", "提醒重复投递被抑制（标记已存在）")
+
+                    ReminderMark.WRITE_FAILED ->
+                        // 写入失败≠去重成功：持久化状态未知，保守跳过投递避免重复提醒
+                        diag.log("RMD", "消费标记写盘失败，保守跳过本次投递（避免重复提醒）threshold=${thresholdMs}ms")
                 }
-                if (!env.notificationsEnabled()) {
-                    diag.log("RMD", "提醒投递时通知已被系统禁用，本次提醒无法呈现")
-                    return
-                }
-                env.notifyReminder(firedSessionId, thresholdMs)
-                diag.log(
-                    "RMD",
-                    "提前提醒已投递 threshold=${thresholdMs}ms now=$now trigger=${planned.triggerElapsed} " +
-                        "（实际迟到 ${now - planned.triggerElapsed}ms）"
-                )
             }
         }
     }
@@ -319,13 +384,20 @@ class SessionController internal constructor(
 
                 nowElapsed <= p.triggerElapsed + ReminderPlanner.LATE_WINDOW_MS -> {
                     // 恢复时仍在投递迟到窗口内：照常提醒一次
-                    if (repo.markReminderConsumed(key)) {
-                        if (env.notificationsEnabled()) {
-                            env.notifyReminder(snap.sessionId, p.thresholdMs)
-                            diag.log("RMD", "恢复：提醒在迟到窗口内补投 threshold=${p.thresholdMs}ms")
-                        } else {
-                            diag.log("RMD", "恢复：窗口内提醒但通知被禁用，无法呈现")
+                    when (repo.markReminderConsumed(key)) {
+                        ReminderMark.NEW -> {
+                            if (env.notificationsEnabled()) {
+                                env.notifyReminder(snap.sessionId, p.thresholdMs)
+                                diag.log("RMD", "恢复：提醒在迟到窗口内补投 threshold=${p.thresholdMs}ms")
+                            } else {
+                                diag.log("RMD", "恢复：窗口内提醒但通知被禁用，无法呈现")
+                            }
                         }
+
+                        ReminderMark.DUPLICATE -> diag.log("RMD", "恢复：窗口内提醒已被消费过，跳过 key=$key")
+
+                        ReminderMark.WRITE_FAILED ->
+                            diag.log("RMD", "恢复：消费标记写盘失败，保守跳过投递 key=$key")
                     }
                 }
 
@@ -335,7 +407,9 @@ class SessionController internal constructor(
             }
         }
         if (skippedKeys.isNotEmpty()) {
-            repo.markRemindersSkipped(skippedKeys)
+            if (!repo.markRemindersSkipped(skippedKeys)) {
+                diag.log("ERR", "跳过标记写盘失败 keys=$skippedKeys")
+            }
             diag.log("RMD", "恢复：${skippedKeys.size} 个历史提醒已错过，跳过不补发")
         }
     }
@@ -466,6 +540,7 @@ class SessionController internal constructor(
                 if (gen != recheckGeneration) return@submit
                 val locked = keyguardLockedFact()
                 if (!locked && env.isInteractive()) {
+                    noteUnlockDetected("USER_PRESENT 复核")
                     diag.log("RCK", "复核通过 gen=$gen：keyguard 已消失，视为有效解锁")
                     process(SessionEvent.UserPresent(false, repo.peekNextSessionId(), env.nowElapsed()))
                 } else {
@@ -491,10 +566,26 @@ class SessionController internal constructor(
      * 亮屏期间每 2 秒核对"可交互 + keyguard 未锁 + 无会话"。
      * 仅在亮屏时运行、熄屏即停、发现不一致（补出待选择）即停；
      * 不写磁盘、不持有唤醒锁，不替代 USER_PRESENT 主路径，
-     * 专堵"宽限期无凭据放行"等不产生任何广播的解锁路径。
+     * 专堵"宽限期无凭据放行""解锁不发送 USER_PRESENT""服务亮屏恢复后解锁"等
+     * 不产生可用广播的解锁路径。
      */
     private fun startUnlockHeartbeat() {
         env.postDelayed(KEY_HEARTBEAT, HEARTBEAT_MS) { submit { heartbeatOnce() } }
+    }
+
+    /** 恢复协调入口（幂等）：亮屏且 NO_SESSION 时确保解锁心跳在轮询 */
+    private fun coordinateUnlockHeartbeat(source: String) {
+        if (!env.isInteractive()) return
+        if (snapshot.state != SessionState.NO_SESSION) return
+        diag.log("HB", "$source：亮屏且无会话，启动解锁心跳轮询")
+        startUnlockHeartbeat()
+    }
+
+    /** 记录最近一次有效解锁检测（诊断健康页展示） */
+    private fun noteUnlockDetected(source: String) {
+        val wall = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
+        lastUnlockDetected = "$wall（$source）"
     }
 
     private fun heartbeatOnce() {
@@ -505,6 +596,7 @@ class SessionController internal constructor(
         if (snapshot.state != SessionState.NO_SESSION) return // 会话存在：无需再查
         if (!repo.isMonitoringEnabled() || !env.isAdminActive() || !env.canDrawOverlays()) return
         if (!env.isKeyguardLocked() && !env.isDeviceLocked()) {
+            noteUnlockDetected("解锁心跳")
             diag.log("HB", "心跳发现已解锁且无会话：补上待选择（宽限期放行或广播丢失）")
             process(SessionEvent.ScreenOn(interactive = true, keyguardLocked = false, nextSessionId = repo.peekNextSessionId()))
             return
@@ -551,7 +643,10 @@ class SessionController internal constructor(
         snapshot = newSnap
         if (newSnap.sessionId != from.sessionId) {
             if (from.sessionId != 0L) previousSessionId = from.sessionId
-            if (newSnap.sessionId != 0L) repo.commitSessionId(newSnap.sessionId)
+            // 会话标识先于快照同步落盘：即使快照写盘失败，恢复后也不会复用旧标识
+            if (newSnap.sessionId != 0L && !repo.commitSessionId(newSnap.sessionId)) {
+                diag.log("ERR", "会话标识写盘失败 id=${newSnap.sessionId}（重启后可能重号）")
+            }
         }
         // R1：会话结束/替换时取消锁屏重试与看门狗
         if (newSnap.sessionId != from.sessionId ||
@@ -564,11 +659,16 @@ class SessionController internal constructor(
             (label(ev) + ": ${from.state}(${from.sessionId}) → ${newSnap.state}(${newSnap.sessionId})")
                 .let { if (t.note != null) "$it note=${t.note}" else it }
         )
-        // 会话结束：清理该会话的提醒任务与通知（用旧快照的配置）
+        // 会话结束：清理该会话的提醒任务与通知（用旧会话自己的快照配置）。
+        // 单位边界：快照存"秒"，取消接口收"毫秒"——必须换算后才能与排定时的
+        // 任务身份（requestCode=200000+秒、通知 ID=5000+秒）对上，否则取消落空。
         if (from.isActive && !newSnap.isActive) {
-            env.cancelReminderAlarms(from.sessionReminderThresholds)
-            env.cancelReminderNotifications(from.sessionReminderThresholds)
-            repo.clearConsumedReminders(from.sessionId)
+            val thresholdsMs = from.sessionReminderThresholds.map { it * 1000L }
+            env.cancelReminderAlarms(thresholdsMs)
+            env.cancelReminderNotifications(thresholdsMs)
+            if (!repo.clearConsumedReminders(from.sessionId)) {
+                diag.log("ERR", "会话 ${from.sessionId} 消费标记清理写盘失败（残留标记不影响新会话）")
+            }
         }
         execute(t.actions, newSnap, from)
         publish()
@@ -590,7 +690,12 @@ class SessionController internal constructor(
                 when (a) {
                     SessionAction.Persist -> {
                         repo.setBootAtSave(env.bootCount())
-                        repo.saveSnapshot(snap)
+                        if (!repo.saveSnapshot(snap)) {
+                            diag.log(
+                                "ERR",
+                                "快照写盘失败 state=${snap.state} id=${snap.sessionId}（进程回收后可能回退旧状态）"
+                            )
+                        }
                     }
 
                     SessionAction.ShowSelectionOverlay -> showSelectionOverlay(snap)
@@ -747,26 +852,51 @@ class SessionController internal constructor(
 
     /**
      * 提醒兜底：真机（ColorOS）实测会把同应用的多个精确闹钟合并推迟（60s 提醒被推到
-     * 30s 时刻才触发，超窗被正确跳过）。tick 每秒运行，发现"已到点且未消费"的提醒
-     * 立即投递（消费标记先行），把提醒准时性从闹钟路径的 ±OEM 推迟补到 ±1s。
-     * 到期锁屏不依赖本兜底（主路径仍是到期闹钟）。
+     * 30s 时刻才触发，超窗被正确跳过）。tick 每秒运行，发现"已到点且仍在迟到窗口内"
+     * 的提醒立即投递（消费标记先行），把提醒准时性从闹钟路径的 ±OEM 推迟补到 ±1s。
+     * 与广播/恢复路径共用 [ReminderPlanner.classify] 的 2 秒迟到窗口与消费判定：
+     * 超窗（回调停顿跨过窗口）记录为跳过，绝不补发过时的"一分钟/半分钟"提醒。
+     * 到期锁屏不依赖本兜底（主路径仍是到期闹钟，且 tickOnce 先检查截止）。
      */
     private fun deliverDueRemindersViaTick(snap: SessionSnapshot, now: Long) {
         if (snap.sessionReminderThresholds.isEmpty()) return
         val duration = snap.deadlineElapsed - snap.startedElapsed
+        val skipped = ArrayList<String>(1)
         for (t in snap.sessionReminderThresholds) {
-            val trigger = snap.deadlineElapsed - t * 1000L
-            if (t * 1000L !in 1 until duration) continue
+            val thresholdMs = t * 1000L
+            if (thresholdMs !in 1 until duration) continue
+            val trigger = snap.deadlineElapsed - thresholdMs
             if (now < trigger) continue
-            val key = "${snap.sessionId}:${t * 1000L}"
+            val key = "${snap.sessionId}:$thresholdMs"
             if (key in repo.consumedReminders()) continue
-            if (!repo.markReminderConsumed(key)) continue
-            if (env.notificationsEnabled()) {
-                env.notifyReminder(snap.sessionId, t * 1000L)
-                diag.log("RMD", "tick 兜底投递提醒 threshold=${t * 1000L}ms（闹钟迟到补偿）now=$now trigger=$trigger")
-            } else {
-                diag.log("RMD", "tick 兜底发现到点提醒但通知被禁用，无法呈现 threshold=${t * 1000L}ms")
+            when (ReminderPlanner.classify(ReminderPlanner.PlannedReminder(thresholdMs, trigger), now)) {
+                // 不可达：now < trigger 已在上方过滤（classify 仅在 now<trigger 时返回 FUTURE）
+                ReminderPlanner.Outcome.SCHEDULE_FUTURE -> Unit
+
+                ReminderPlanner.Outcome.SKIP_MISSED -> {
+                    skipped.add(key)
+                    diag.log("RMD", "tick 发现提醒已超迟到窗口（now=$now trigger=$trigger），跳过不补发")
+                }
+
+                ReminderPlanner.Outcome.DELIVER_NOW -> when (repo.markReminderConsumed(key)) {
+                    ReminderMark.NEW -> {
+                        if (env.notificationsEnabled()) {
+                            env.notifyReminder(snap.sessionId, thresholdMs)
+                            diag.log("RMD", "tick 兜底投递提醒 threshold=${thresholdMs}ms now=$now trigger=$trigger")
+                        } else {
+                            diag.log("RMD", "tick 兜底发现到点提醒但通知被禁用，无法呈现 threshold=${thresholdMs}ms")
+                        }
+                    }
+
+                    ReminderMark.DUPLICATE -> Unit // 广播路径已投递：去重生效
+
+                    ReminderMark.WRITE_FAILED ->
+                        diag.log("RMD", "tick：消费标记写盘失败，保守跳过投递 key=$key")
+                }
             }
+        }
+        if (skipped.isNotEmpty() && !repo.markRemindersSkipped(skipped)) {
+            diag.log("ERR", "tick 跳过标记写盘失败 keys=$skipped")
         }
     }
 
@@ -829,7 +959,14 @@ class SessionController internal constructor(
     // ------------------------------------------------------------------
 
     fun startMonitoringService() {
+        lastServiceStartReason = "controller 启动监控"
         env.startMonitoringService("controller 启动监控")
+    }
+
+    /** 诊断健康页：监控前台服务当前是否挂载 */
+    fun isServiceAttached(): Boolean {
+        startIfNeeded()
+        return env.isServiceAttached()
     }
 
     private fun stopMonitoringService() {

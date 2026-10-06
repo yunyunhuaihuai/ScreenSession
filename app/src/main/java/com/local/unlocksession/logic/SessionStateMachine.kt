@@ -19,12 +19,6 @@ object SessionMachine {
     /** 会话时长上限（毫秒）：48 小时，防溢出与误输入 */
     const val MAX_SESSION_MS: Long = DurationInput.MAX_MINUTES * 60_000L
 
-    /**
-     * 同解锁周期重复事件的容忍窗口：会话开始后短时间内的重复 USER_PRESENT
-     * 视为同一次解锁的迟到/重复广播，不重置会话（R4）。
-     */
-    const val DUPLICATE_UNLOCK_WINDOW_MS: Long = 3000L
-
     fun reduce(cur: SessionSnapshot, ev: SessionEvent): Transition = when (ev) {
         is SessionEvent.ScreenOn -> onScreenOn(cur, ev)
         is SessionEvent.ScreenOff -> onScreenOff(cur, ev)
@@ -164,26 +158,17 @@ object SessionMachine {
             )
 
             SessionState.TIMING, SessionState.UNLIMITED -> {
-                // R4：会话开始后短窗口内的重复 USER_PRESENT 是同一解锁周期的迟到/重复广播，
-                // 不得替换会话、取消截止时间或重新触发提醒；只有距会话开始较远的 USER_PRESENT
-                // 才可能是漏记的真实锁屏-再解锁（此时正确语义是旧会话已结束、重新选择）。
-                if (ev.nowElapsed - cur.startedElapsed <= DUPLICATE_UNLOCK_WINDOW_MS) {
-                    Transition(
-                        cur,
-                        note = "USER_PRESENT 距会话开始 ${ev.nowElapsed - cur.startedElapsed}ms，判定同解锁周期重复事件，保持会话"
-                    )
-                } else {
-                    Transition(
-                        pending(ev.nextSessionId),
-                        listOf(
-                            SessionAction.CancelAlarm,
-                            SessionAction.Persist,
-                            SessionAction.ShowSelectionOverlay,
-                            SessionAction.UpdateNotification
-                        ),
-                        "活动中出现 USER_PRESENT：此前漏记锁屏-再解锁，旧会话作废并重新选择"
-                    )
-                }
+                // R4：活动会话中的 USER_PRESENT 一律视为同一解锁周期的迟到/重复广播。
+                // 依据：真实锁屏周期由 SCREEN_OFF（结束会话）/SCREEN_ON（keyguard 已锁时
+                // 补记结束）先行处理——只要会话仍处于活动中，说明本进程从未观察到锁屏
+                // 周期；"事件来得晚"本身不构成发生过真实锁屏的证据（广播可能迟到、重复，
+                // 或由系统在锁屏未发生时补发）。保持原会话与截止时间，防止借此取消到期
+                // 任务重新选择加时。
+                Transition(
+                    cur,
+                    note = "USER_PRESENT 到达但会话活动中（未观察到锁屏周期），保持会话与截止时间" +
+                        "（started=${cur.startedElapsed}, now=${ev.nowElapsed}）"
+                )
             }
 
             SessionState.LOCK_REQUESTED -> Transition(

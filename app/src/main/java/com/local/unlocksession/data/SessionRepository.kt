@@ -32,20 +32,31 @@ class SessionRepository(context: Context) : SessionStore {
         sessionReminderThresholds = parseLongList(prefs.getString(KEY_SESSION_REMINDER_THRESHOLDS, null))
     )
 
-    override fun saveSnapshot(s: SessionSnapshot) {
-        prefs.edit()
-            .putString(KEY_STATE, s.state.name)
-            .putLong(KEY_SESSION_ID, s.sessionId)
-            .putLong(KEY_STARTED_ELAPSED, s.startedElapsed)
-            .putLong(KEY_DEADLINE_ELAPSED, s.deadlineElapsed)
-            .putString(KEY_LOCK_ERROR, s.lockError)
-            .putBoolean(KEY_ALARM_SCHEDULED, s.alarmScheduled)
-            .putBoolean(KEY_SESSION_REMINDERS_ENABLED, s.sessionRemindersEnabled)
-            .putString(KEY_SESSION_REMINDER_THRESHOLDS, s.sessionReminderThresholds.joinToString(","))
-            // 保存时刻的恢复信息：用于判断同次开机
-            .putLong(KEY_SAVED_ELAPSED, android.os.SystemClock.elapsedRealtime())
-            .putInt(KEY_BOOT_AT_SAVE, bootAtSave)
-            .apply()
+    /**
+     * 关键快照同步落盘：commit() 在调用线程（控制器单线程，非主线程）上确认磁盘写入。
+     * 返回 false = 写盘失败：内存值已更新，但进程被回收后可能回退到旧快照，
+     * 调用方必须如实记录，不能当作已持久化。
+     */
+    override fun saveSnapshot(s: SessionSnapshot): Boolean {
+        val ok = try {
+            prefs.edit()
+                .putString(KEY_STATE, s.state.name)
+                .putLong(KEY_SESSION_ID, s.sessionId)
+                .putLong(KEY_STARTED_ELAPSED, s.startedElapsed)
+                .putLong(KEY_DEADLINE_ELAPSED, s.deadlineElapsed)
+                .putString(KEY_LOCK_ERROR, s.lockError)
+                .putBoolean(KEY_ALARM_SCHEDULED, s.alarmScheduled)
+                .putBoolean(KEY_SESSION_REMINDERS_ENABLED, s.sessionRemindersEnabled)
+                .putString(KEY_SESSION_REMINDER_THRESHOLDS, s.sessionReminderThresholds.joinToString(","))
+                // 保存时刻的恢复信息：用于判断同次开机
+                .putLong(KEY_SAVED_ELAPSED, android.os.SystemClock.elapsedRealtime())
+                .putInt(KEY_BOOT_AT_SAVE, bootAtSave)
+                .commit()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "saveSnapshot 失败", e)
+            false
+        }
+        return ok
     }
 
     /** 保存时由控制器注入的当前 boot 计数 */
@@ -69,27 +80,43 @@ class SessionRepository(context: Context) : SessionStore {
         prefs.getStringSet(KEY_CONSUMED_REMINDERS, emptySet()) ?: emptySet()
 
     /**
-     * 可靠保存消费标记（提示词：消费标记必须在通知请求之前保存）。
-     * 返回 false 表示该标记已存在（重复投递），调用方不得再次提醒。
+     * 可靠保存消费标记（消费标记必须在通知请求之前确认落盘）。
+     * 注意：通知请求与磁盘事务无法组成原子操作——先标记后投递的崩溃窗口是
+     * "标记已存、通知未发"（宁可漏提醒不可重发）；本产品优先避免重复历史提醒。
      */
-    override fun markReminderConsumed(key: String): Boolean {
+    override fun markReminderConsumed(key: String): ReminderMark {
         val cur = consumedReminders()
-        if (key in cur) return false
-        prefs.edit().putStringSet(KEY_CONSUMED_REMINDERS, cur + key).apply()
-        return true
+        if (key in cur) return ReminderMark.DUPLICATE
+        val ok = try {
+            prefs.edit().putStringSet(KEY_CONSUMED_REMINDERS, cur + key).commit()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "markReminderConsumed 失败 key=$key", e)
+            false
+        }
+        return if (ok) ReminderMark.NEW else ReminderMark.WRITE_FAILED
     }
 
-    override fun markRemindersSkipped(keys: Collection<String>) {
-        if (keys.isEmpty()) return
+    override fun markRemindersSkipped(keys: Collection<String>): Boolean {
+        if (keys.isEmpty()) return true
         val cur = consumedReminders()
-        prefs.edit().putStringSet(KEY_CONSUMED_REMINDERS, cur + keys).apply()
+        return try {
+            prefs.edit().putStringSet(KEY_CONSUMED_REMINDERS, cur + keys).commit()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "markRemindersSkipped 失败", e)
+            false
+        }
     }
 
     /** 会话结束清空消费标记（只属于该会话的键） */
-    override fun clearConsumedReminders(sessionId: Long) {
+    override fun clearConsumedReminders(sessionId: Long): Boolean {
         val prefix = "$sessionId:"
         val keep = consumedReminders().filterNot { it.startsWith(prefix) }.toSet()
-        prefs.edit().putStringSet(KEY_CONSUMED_REMINDERS, keep).apply()
+        return try {
+            prefs.edit().putStringSet(KEY_CONSUMED_REMINDERS, keep).commit()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "clearConsumedReminders 失败 sessionId=$sessionId", e)
+            false
+        }
     }
 
     // ---------------- 会话标识 ----------------
@@ -97,14 +124,23 @@ class SessionRepository(context: Context) : SessionStore {
     /** 下一个可用会话标识（预览，不递增） */
     override fun peekNextSessionId(): Long = prefs.getLong(KEY_NEXT_SESSION_ID, 1L)
 
-    /** 状态机实际使用了该标识后提交递增 */
-    override fun commitSessionId(used: Long) {
-        if (used >= peekNextSessionId()) {
-            prefs.edit().putLong(KEY_NEXT_SESSION_ID, used + 1).apply()
+    /**
+     * 状态机实际使用了该标识后提交递增。同步落盘且先于快照保存：
+     * 即使快照写盘失败，旧标识也不会在恢复后被复用（最多跳号，不重号）。
+     */
+    override fun commitSessionId(used: Long): Boolean {
+        if (used < peekNextSessionId()) return true
+        return try {
+            prefs.edit().putLong(KEY_NEXT_SESSION_ID, used + 1).commit()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "commitSessionId 失败 used=$used", e)
+            false
         }
     }
 
     // ---------------- 配置 ----------------
+    // 以下为普通配置项：允许 apply() 异步落盘（主线程可调用，不做关键同步写入）。
+    // 它们不参与会话身份与截止时间的恢复正确性，丢失一次只影响下次偏好。
 
     override fun isMonitoringEnabled(): Boolean = prefs.getBoolean(KEY_MONITORING, true)
 
@@ -162,6 +198,7 @@ class SessionRepository(context: Context) : SessionStore {
     }
 
     companion object {
+        private const val TAG = "SessionRepository"
         private const val PREFS_NAME = "unlock_session"
         private const val KEY_STATE = "state"
         private const val KEY_SESSION_ID = "session_id"

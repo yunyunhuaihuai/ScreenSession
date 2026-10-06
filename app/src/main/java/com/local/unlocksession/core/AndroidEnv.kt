@@ -205,6 +205,8 @@ class AndroidEnv(
         }
     }
 
+    override fun isServiceAttached(): Boolean = foregroundService != null
+
     override fun postUi(block: () -> Unit) {
         mainHandler.post(block)
     }

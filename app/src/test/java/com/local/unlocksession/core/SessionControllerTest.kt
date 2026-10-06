@@ -1,5 +1,6 @@
 package com.local.unlocksession.core
 
+import com.local.unlocksession.data.ReminderMark
 import com.local.unlocksession.data.SessionStore
 import java.util.concurrent.AbstractExecutorService
 import com.local.unlocksession.logic.SessionEvent
@@ -47,10 +48,20 @@ class SessionControllerTest {
         var remindersEnabledFlag = true
         var thresholds = listOf(60L, 30L)
 
+        /** 模拟磁盘写入失败（commit() 返回 false）：关键写入不落盘 */
+        var failCriticalWrites = false
+        var criticalWriteFailures = 0
+
         override fun loadSnapshot(): SessionSnapshot = snapshotData
-        override fun saveSnapshot(s: SessionSnapshot) {
+
+        override fun saveSnapshot(s: SessionSnapshot): Boolean {
+            if (failCriticalWrites) {
+                criticalWriteFailures++
+                return false
+            }
             snapshotData = s
             savedElapsedValue = 999_999L
+            return true
         }
 
         override fun setBootAtSave(value: Int) {
@@ -60,18 +71,42 @@ class SessionControllerTest {
         override fun savedBootCount(): Int = bootAtSaveValue
         override fun savedElapsed(): Long = savedElapsedValue
         override fun peekNextSessionId(): Long = nextId
-        override fun commitSessionId(used: Long) {
+
+        override fun commitSessionId(used: Long): Boolean {
+            if (failCriticalWrites) {
+                criticalWriteFailures++
+                return false
+            }
             if (used >= nextId) nextId = used + 1
+            return true
         }
 
         override fun consumedReminders(): Set<String> = consumed.toSet()
-        override fun markReminderConsumed(key: String): Boolean = consumed.add(key)
-        override fun markRemindersSkipped(keys: Collection<String>) {
-            consumed.addAll(keys)
+
+        override fun markReminderConsumed(key: String): ReminderMark {
+            if (failCriticalWrites) {
+                criticalWriteFailures++
+                return ReminderMark.WRITE_FAILED
+            }
+            return if (consumed.add(key)) ReminderMark.NEW else ReminderMark.DUPLICATE
         }
 
-        override fun clearConsumedReminders(sessionId: Long) {
+        override fun markRemindersSkipped(keys: Collection<String>): Boolean {
+            if (failCriticalWrites) {
+                criticalWriteFailures++
+                return false
+            }
+            consumed.addAll(keys)
+            return true
+        }
+
+        override fun clearConsumedReminders(sessionId: Long): Boolean {
+            if (failCriticalWrites) {
+                criticalWriteFailures++
+                return false
+            }
             consumed.removeAll { it.startsWith("$sessionId:") }
+            return true
         }
 
         override fun isMonitoringEnabled(): Boolean = monitoring
@@ -128,6 +163,9 @@ class SessionControllerTest {
         var deadlineAlarmCancels = 0
         val reminderAlarms = mutableListOf<Triple<Long, Long, Long>>()
         val reminderAlarmCancels = mutableListOf<Long>()
+        val reminderNotificationCancels = mutableListOf<Long>()
+        val serviceStarts = mutableListOf<String>()
+        var serviceAttached = false
         val lockCalls = mutableListOf<Long>()
         val enforceLockCalls = mutableListOf<Int>()
         val sessionNotifies = mutableListOf<Pair<SessionSnapshot, Boolean>>()
@@ -188,10 +226,26 @@ class SessionControllerTest {
 
         override fun hasDelayed(key: String): Boolean = delayed.containsKey(key)
 
-        override fun attachForegroundService(service: android.app.Service) = Unit
-        override fun detachForegroundService(service: android.app.Service) = Unit
-        override fun startMonitoringService(reason: String) = Unit
-        override fun stopMonitoringService() = Unit
+        override fun attachForegroundService(service: android.app.Service) {
+            serviceAttached = true
+        }
+
+        override fun detachForegroundService(service: android.app.Service) {
+            serviceAttached = false
+        }
+
+        override fun startMonitoringService(reason: String) {
+            serviceStarts += reason
+            // 模拟正常结果：startForegroundService 后服务很快挂载
+            serviceAttached = true
+        }
+
+        override fun stopMonitoringService() {
+            serviceAttached = false
+        }
+
+        override fun isServiceAttached(): Boolean = serviceAttached
+
         override fun postUi(block: () -> Unit) = block()
 
         override fun showSelectionOverlay(snap: SessionSnapshot) {
@@ -223,7 +277,7 @@ class SessionControllerTest {
         }
 
         override fun cancelReminderNotifications(thresholdsMs: Collection<Long>) {
-            // 记录即可
+            reminderNotificationCancels += thresholdsMs
         }
 
         override fun cancelTestReminder() {
@@ -242,6 +296,15 @@ class SessionControllerTest {
                 due.value.second()
             }
             now = target
+        }
+
+        /**
+         * 只推进时钟，不执行任何到期回调（模拟回调停顿：ColorOS 冻结、线程卡住）。
+         * 恢复执行用 [advance]：停顿期间排队的回调按队列顺序补跑，
+         * 每个回调执行时读到的是恢复后的当前时刻（与真实 Handler 行为一致）。
+         */
+        fun advanceFrozen(ms: Long) {
+            now += ms
         }
     }
 
@@ -792,5 +855,302 @@ class SessionControllerTest {
         env.advance(500) // 到期：tick 触发锁屏
         assertEquals(SessionState.LOCK_REQUESTED, c.snapshot.state)
         assertEquals(1, env.lockCalls.size)
+    }
+
+    // ------------------------------------------------------------------
+    // 提醒取消的单位一致性（秒→毫秒）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `会话结束时按毫秒身份取消提醒闹钟与通知`() {
+        val (c, env, _) = newController()
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 120_000L)
+        // 排定身份：60 秒 → requestCode 200060 / 通知 ID 5060（毫秒口径 60000）
+        assertEquals(
+            listOf(Triple(1L, 60_000L, 160_000L), Triple(1L, 30_000L, 190_000L)),
+            env.reminderAlarms
+        )
+        // 60 秒提醒已投递（通知已显示）
+        env.advance(60_000)
+        c.handleReminderAsync(c.snapshot.sessionId, 60_000L) {}
+        assertEquals(listOf(60_000L), env.remindersShown)
+        // 提前锁屏结束会话：取消必须用毫秒身份对上排定任务
+        env.kgLocked = true
+        env.devLocked = true
+        c.signalScreenOff()
+        assertEquals(listOf(30000L, 60000L), env.reminderAlarmCancels)
+        assertEquals(listOf(30000L, 60000L), env.reminderNotificationCancels)
+        // 新会话不再被旧提醒闹钟打扰（旧到点广播因身份/标记全部失效）
+        env.kgLocked = false
+        env.devLocked = false
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 120_000L)
+        val newId = c.snapshot.sessionId
+        env.advance(60_000)
+        c.handleReminderAsync(newId, 60_000L) {} // 新会话自己的 60s 提醒照常
+        assertEquals(listOf(60_000L, 60_000L), env.remindersShown)
+    }
+
+    @Test
+    fun `重启废弃旧会话同样按毫秒身份取消提醒`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        store.snapshotData = SessionSnapshot(
+            state = SessionState.TIMING, sessionId = 5L,
+            startedElapsed = env.now - 60_000L, deadlineElapsed = env.now + 60_000L,
+            sessionRemindersEnabled = true, sessionReminderThresholds = listOf(60L, 30L)
+        )
+        store.bootAtSaveValue = 16 // 旧开机
+        env.boot = 17
+        val c = SessionController(store, RecordingDiag(), env, directExecutor)
+        c.startIfNeeded()
+        c.recover("重启后恢复检查")
+        assertEquals(setOf(30000L, 60000L), env.reminderAlarmCancels.toSet())
+        assertEquals(setOf(30000L, 60000L), env.reminderNotificationCancels.toSet())
+    }
+
+    // ------------------------------------------------------------------
+    // 冷启动恢复：广播拉起进程后恢复监控（回归 A）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `到期广播拉起新进程后完成锁屏并恢复监控服务`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        // 新进程：只有持久化数据，服务未挂载；会话已过期
+        store.snapshotData = SessionSnapshot(
+            state = SessionState.TIMING, sessionId = 5L,
+            startedElapsed = env.now - 120_000L, deadlineElapsed = env.now - 1_000L
+        )
+        store.bootAtSaveValue = 17
+        env.boot = 17
+        val c = SessionController(store, RecordingDiag(), env, directExecutor)
+        c.startIfNeeded()
+        assertEquals("前置：服务未挂载", false, env.isServiceAttached())
+        var finished = 0
+        c.handleAlarmAsync(5L) { finished++ }
+        // 到期锁屏由广播路径完成，不依赖服务启动
+        assertEquals(SessionState.LOCK_REQUESTED, c.snapshot.state)
+        assertEquals(1, env.lockCalls.size)
+        assertEquals(1, finished)
+        // 同时已请求恢复监控服务（幂等恢复）
+        assertTrue(env.serviceStarts.isNotEmpty())
+        assertTrue(env.serviceStarts.first().contains("恢复监控"))
+    }
+
+    @Test
+    fun `提醒广播拉起新进程后投递提醒并恢复监控服务`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        store.snapshotData = SessionSnapshot(
+            state = SessionState.TIMING, sessionId = 6L,
+            startedElapsed = env.now - 60_000L, deadlineElapsed = env.now + 60_000L,
+            sessionRemindersEnabled = true, sessionReminderThresholds = listOf(60L, 30L)
+        )
+        store.bootAtSaveValue = 17
+        env.boot = 17
+        val c = SessionController(store, RecordingDiag(), env, directExecutor)
+        c.startIfNeeded()
+        c.handleReminderAsync(6L, 60_000L) {}
+        assertEquals("60s 时点在 2s 迟到窗口内（恰好到点）", listOf(60_000L), env.remindersShown)
+        assertTrue(env.serviceStarts.isNotEmpty())
+    }
+
+    @Test
+    fun `监控关闭时唤醒入口不复活监控服务`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        store.monitoring = false
+        store.snapshotData = SessionSnapshot(
+            state = SessionState.TIMING, sessionId = 7L,
+            startedElapsed = env.now - 120_000L, deadlineElapsed = env.now - 1_000L
+        )
+        store.bootAtSaveValue = 17
+        env.boot = 17
+        val c = SessionController(store, RecordingDiag(), env, directExecutor)
+        c.startIfNeeded()
+        c.handleAlarmAsync(7L) {}
+        // 用户主动关闭的监控不得被旧事件复活
+        assertTrue(env.serviceStarts.isEmpty())
+        assertFalse(env.isServiceAttached())
+    }
+
+    // ------------------------------------------------------------------
+    // 服务恢复后的解锁心跳（回归 B：仅改变锁屏事实，无任何广播）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `亮屏密码锁状态下恢复后_仅改变锁屏事实_心跳周期内补出待选择`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        store.snapshotData = SessionSnapshot() // NO_SESSION
+        val c = SessionController(store, RecordingDiag(), env, directExecutor)
+        c.startIfNeeded()
+        // 服务在屏幕已亮、keyguard 密码锁仍显示、NO_SESSION 时被恢复
+        env.interactive = true
+        env.kgLocked = true
+        env.devLocked = true
+        c.recover("STICKY 恢复")
+        assertEquals(SessionState.NO_SESSION, c.snapshot.state)
+        assertTrue("恢复时不应凭亮屏建会话", env.overlaysShown.isEmpty())
+        // 用户输入密码解锁：只改变锁屏事实，不发送 SCREEN_ON / USER_PRESENT
+        env.kgLocked = false
+        env.devLocked = false
+        env.advance(2_000) // 一个心跳周期
+        assertEquals(SessionState.PENDING_SELECTION, c.snapshot.state)
+        assertEquals(1, env.overlaysShown.size)
+        // 建会话后心跳停止（不重复弹面板）
+        val id = c.snapshot.sessionId
+        c.select(id, false, 60_000L)
+        env.advance(10_000)
+        assertEquals(SessionState.TIMING, c.snapshot.state)
+        assertEquals(1, env.overlaysShown.size)
+    }
+
+    @Test
+    fun `恢复时已有会话或熄屏则心跳不启动`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        store.snapshotData = SessionSnapshot(
+            state = SessionState.TIMING, sessionId = 8L,
+            startedElapsed = env.now - 10_000L, deadlineElapsed = env.now + 50_000L
+        )
+        val c = SessionController(store, RecordingDiag(), env, directExecutor)
+        c.startIfNeeded()
+        env.interactive = true
+        env.kgLocked = false
+        env.devLocked = false
+        c.recover("STICKY 恢复")
+        assertEquals(SessionState.TIMING, c.snapshot.state)
+        // 已有会话：不排心跳任务
+        assertFalse(env.hasDelayed("unlock-heartbeat"))
+        // 熄屏恢复：同样不排
+        val env2 = FakeEnv()
+        val c2 = SessionController(FakeStore(), RecordingDiag(), env2, directExecutor)
+        c2.startIfNeeded()
+        env2.interactive = false
+        env2.kgLocked = true
+        c2.recover("STICKY 恢复")
+        assertFalse(env2.hasDelayed("unlock-heartbeat"))
+    }
+
+    // ------------------------------------------------------------------
+    // 提醒迟到窗口统一：tick 与广播共用判定
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `回调停顿跨过提醒窗口后不补发历史提醒`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        val diag = RecordingDiag()
+        val c = SessionController(store, diag, env, directExecutor)
+        c.startIfNeeded()
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 90_000L) // deadline=190000；60s→130000、30s→160000
+        // 回调停顿：tick 跑到 +25s 后冻结 +45s（剩余 20s），期间提醒广播也未处理
+        env.advance(25_000)
+        assertEquals(SessionState.TIMING, c.snapshot.state)
+        env.advanceFrozen(45_000)
+        assertEquals(170_000L, env.now)
+        // 恢复执行：停顿期间排队的 tick 回调补跑，读到当前时刻
+        env.advance(0)
+        assertEquals("超窗提醒不得补发", emptyList<Long>(), env.remindersShown)
+        assertTrue(store.consumed.contains("1:60000"))
+        assertTrue(store.consumed.contains("1:30000"))
+        assertTrue(diag.has("RMD", "跳过不补发"))
+        // 剩余时间继续走完：到期锁屏优先，不受停顿影响
+        env.advance(20_000)
+        assertEquals(SessionState.LOCK_REQUESTED, c.snapshot.state)
+        assertEquals(1, env.lockCalls.size)
+    }
+
+    @Test
+    fun `停顿落在迟到窗口内仍正常投递`() {
+        val (c, env, _) = newController()
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 120_000L) // deadline=220000；60s→160000
+        env.advance(59_000) // now=159000
+        env.advanceFrozen(2_000) // now=161000 = trigger+1s，仍在 2s 窗口内
+        env.advance(0)
+        assertEquals("窗口内的及时提醒照常投递", listOf(60_000L), env.remindersShown)
+        // 迟到的广播路径到达：已消费 → 不重复
+        c.handleReminderAsync(c.snapshot.sessionId, 60_000L) {}
+        assertEquals(1, env.remindersShown.size)
+    }
+
+    @Test
+    fun `截止后到达的旧提醒广播转锁屏不发提醒`() {
+        val (c, env, _) = newController()
+        startTiming(c, 60_000L)
+        env.advance(60_000) // tick 兜底触发到期锁屏
+        assertEquals(SessionState.LOCK_REQUESTED, c.snapshot.state)
+        val shown = env.remindersShown.size
+        c.handleReminderAsync(c.snapshot.sessionId, 30_000L) {} // 迟到的提醒广播
+        assertEquals("已过截止：锁屏优先，不再发提醒", shown, env.remindersShown.size)
+    }
+
+    // ------------------------------------------------------------------
+    // 重复 USER_PRESENT：不按会话年龄重置（R4 新语义）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `超过三秒的重复USER_PRESENT不改变会话与截止时间`() {
+        val (c, env, _) = newController()
+        startTiming(c, 60_000L)
+        val id = c.snapshot.sessionId
+        val deadline = c.snapshot.deadlineElapsed
+        val overlaysBefore = env.overlaysShown.size
+        env.advance(10_000) // 远超旧的 3 秒窗口
+        c.signalUserPresent() // 迟到/重复的解锁广播
+        assertEquals(SessionState.TIMING, c.snapshot.state)
+        assertEquals(id, c.snapshot.sessionId)
+        assertEquals("截止时间不得被重置", deadline, c.snapshot.deadlineElapsed)
+        assertEquals("不得重新弹选择层", overlaysBefore, env.overlaysShown.size)
+    }
+
+    // ------------------------------------------------------------------
+    // 持久化失败：区分重复标记与写盘失败
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `消费标记写盘失败时保守跳过投递并如实记录`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        val diag = RecordingDiag()
+        val c = SessionController(store, diag, env, directExecutor)
+        c.startIfNeeded()
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 120_000L)
+        store.failCriticalWrites = true
+        env.advance(60_000)
+        c.handleReminderAsync(c.snapshot.sessionId, 60_000L) {}
+        assertEquals("写盘失败≠去重成功：不得投递", emptyList<Long>(), env.remindersShown)
+        assertTrue(diag.has("RMD", "写盘失败"))
+        assertTrue(diag.has("RMD", "保守跳过"))
+        // 磁盘恢复后同一时点的再次触发：标记成功落盘，照常投递一次
+        store.failCriticalWrites = false
+        c.handleReminderAsync(c.snapshot.sessionId, 60_000L) {}
+        assertEquals(listOf(60_000L), env.remindersShown)
+    }
+
+    @Test
+    fun `快照与会话标识写盘失败如实记录且会话继续`() {
+        val env = FakeEnv()
+        val store = FakeStore()
+        val diag = RecordingDiag()
+        val c = SessionController(store, diag, env, directExecutor)
+        c.startIfNeeded()
+        store.failCriticalWrites = true
+        c.signalUserPresent()
+        c.select(c.snapshot.sessionId, false, 60_000L)
+        assertEquals("内存状态不受磁盘失败影响", SessionState.TIMING, c.snapshot.state)
+        assertTrue("快照写盘失败必须留痕", diag.has("ERR", "快照写盘失败"))
+        assertTrue(diag.has("ERR", "会话标识写盘失败"))
+        assertTrue(store.criticalWriteFailures >= 2)
+        store.failCriticalWrites = false
+        // 会话照常到期锁屏（内存状态一致）
+        env.advance(60_000)
+        assertEquals(SessionState.LOCK_REQUESTED, c.snapshot.state)
     }
 }

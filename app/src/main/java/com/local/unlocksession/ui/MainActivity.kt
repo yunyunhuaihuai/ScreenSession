@@ -139,7 +139,19 @@ class MainActivity : Activity() {
                         .setData(Uri.parse("package:$packageName"))
                 )
             } catch (e: Exception) {
-                toast("无法打开电池优化设置：${e.message}")
+                // 回退 1：电池优化列表页；回退 2：应用详情页（ColorOS 定制 ROM 上直连请求可能被裁剪）
+                try {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (e2: Exception) {
+                    try {
+                        startActivity(
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                                .setData(Uri.parse("package:$packageName"))
+                        )
+                    } catch (e3: Exception) {
+                        toast("无法打开电池优化设置：${e3.message}")
+                    }
+                }
             }
         }
         autostartBtn.setOnClickListener { showColorOSGuide() }
