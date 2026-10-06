@@ -112,11 +112,13 @@ object HealthReport {
             val usm = context.getSystemService(UsageStatsManager::class.java) ?: return "无法读取"
             // 无参重载返回本应用自己的桶（API 28+；带包名参数的重载是 API 31 才有）
             when (usm.getAppStandbyBucket()) {
+                // 5 = EXEMPTED（API 31 才有常量，本机 API 29 实测返回该值）
+                5 -> "EXEMPTED（豁免：系统/用户豁免，限制最少）"
                 UsageStatsManager.STANDBY_BUCKET_ACTIVE -> "ACTIVE（活跃）"
                 UsageStatsManager.STANDBY_BUCKET_WORKING_SET -> "WORKING_SET（工作集）"
                 UsageStatsManager.STANDBY_BUCKET_FREQUENT -> "FREQUENT（常用）"
                 UsageStatsManager.STANDBY_BUCKET_RARE -> "RARE（稀有：任务/闹钟受限）"
-                else -> "EXCLUSIVE/受限级别较高"
+                else -> "其他值=${usm.getAppStandbyBucket()}（受限级别较高）"
             }
         } catch (e: Exception) {
             "无法读取（${e.javaClass.simpleName}）"
